@@ -202,3 +202,35 @@ test("a source changed during processing is not recorded as a current result", a
       .toEqual({ earlier: "Published: Original source", repaired: "Published: Later source" });
   } finally { release(); await rm(root, { recursive: true, force: true }); }
 });
+
+test("a hint during active equal-stamp work prevents an earlier read from becoming current", async () => {
+  // #given a prior result and later work held after reading the real source
+  const { root, sourcePath, outputPath, options } = await textTree();
+  const source = join(sourcePath, "note.txt");
+  await utimes(source, ancient, ancient);
+  let entered = () => {};
+  let release = () => {};
+  const read = new Promise<void>((resolve) => { entered = resolve; });
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    await Effect.runPromise(runInitialPass(options()));
+    const held = { ...options(), handle: () => io(async () => {
+      const text = await readFile(source, "utf8");
+      entered();
+      await released;
+      await Bun.write(join(outputPath, "note"), `Published: ${text}`);
+      return [] as string[];
+    }) };
+    // #when a public hint arrives during processing, even before later work is declared
+    await Effect.runPromise(Effect.scoped(openSynchronization(held).pipe(Effect.flatMap((session) =>
+      session.submit(["note"]).pipe(Effect.andThen(io(async () => {
+        await read;
+        await Bun.write(source, "Replaced source");
+        await utimes(source, ancient, ancient);
+      })), Effect.andThen(session.submit([], { changedPaths: ["note.txt"] })), Effect.andThen(Effect.sync(release)), Effect.andThen(session.awaitCompletion)),
+    ))));
+    await Effect.runPromise(runInitialPass(options()));
+    // #then a fresh instance replays the dirty source instead of accepting the earlier read
+    expect(await readFile(join(outputPath, "note"), "utf8")).toBe("Published: Replaced source");
+  } finally { release(); await rm(root, { recursive: true, force: true }); }
+});

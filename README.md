@@ -74,7 +74,8 @@ checks can miss content replacements that preserve both size and mtime.
 `submit(work)` explicitly reprocesses its described results. Ordinary pass
 admission uses `submit(work, { force: false, changedPaths: [] })`.
 Source-relative `changedPaths` hints invalidate affected saved results even
-when metadata matches. `force: true` bypasses all retained freshness.
+when metadata matches. A hint during active work also prevents that earlier
+read from being recorded as current. `force: true` bypasses all retained freshness.
 Returned required work invalidates its dependent result, so a changed upstream
 cannot shortcut the publication it requires.
 

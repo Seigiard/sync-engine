@@ -111,7 +111,7 @@ export function openFreshness<W, E, R>(
         await save();
       }),
       invalidate: (input: WorkInput = {}) => io(async () => {
-        for (const key of new Set([...records.keys(), ...candidates.keys()])) {
+        for (const key of new Set([...records.keys(), ...candidates.keys(), ...revisions.keys()])) {
           const [, sources]: [string, string[]] = JSON.parse(key);
           if (input.force || input.changedPaths?.some((hint) => sources.some((source) => source === hint || source.startsWith(`${hint}/`)))) invalidateKey(key);
         }
@@ -134,9 +134,10 @@ export function openFreshness<W, E, R>(
           if (dependent) invalidateKey(identity(dependent));
         }
         yield* io(save);
-        if (descriptor && key !== undefined && before !== undefined && revision === revisions.get(key)) {
+        if (descriptor && key !== undefined && before !== undefined) {
           const after = yield* io(() => stamp(descriptor));
-          if (before === after && (yield* io(() => outputsExist(descriptor)))) candidates.set(key, { descriptor, stamp: before, revision });
+          const present = yield* io(() => outputsExist(descriptor));
+          if (revision === revisions.get(key) && before === after && present) candidates.set(key, { descriptor, stamp: before, revision });
         }
         return downstream;
       }).pipe(Effect.onExit((exit) => Effect.sync(() => {
@@ -144,10 +145,13 @@ export function openFreshness<W, E, R>(
       }))),
       commit: io(async () => {
         if (failed) { candidates.clear(); failed = false; return; }
-        for (const [key, candidate] of candidates) {
-          if (candidate.revision === revisions.get(key) && candidate.stamp === await stamp(candidate.descriptor) && await outputsExist(candidate.descriptor)) records.set(key, candidate.stamp);
+        for (const [key, candidate] of Array.from(candidates)) {
+          const current = await stamp(candidate.descriptor);
+          const present = await outputsExist(candidate.descriptor);
+          // Admission can invalidate a result while these filesystem reads are pending.
+          if (candidate.revision === revisions.get(key) && candidate.stamp === current && present) records.set(key, candidate.stamp);
+          if (candidates.get(key) === candidate) candidates.delete(key);
         }
-        candidates.clear();
         await save();
       }),
     };
