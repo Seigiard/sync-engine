@@ -113,3 +113,43 @@ test("an equivalent refresh requested while active publishes the later source", 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("a failed source retains its result while independent work finishes with an observable error", async () => {
+  // #given previously published bytes and an unreadable replacement source
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-errors-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  await mkdir(outputPath);
+  await Bun.write(join(outputPath, "broken"), "Earlier source");
+  await Bun.write(join(sourcePath, "healthy"), "Independent source");
+  try {
+    // #when the public scheduler receives failed work followed by independent work
+    const observation = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* openSynchronization({
+        sourcePath, outputPath,
+        declare: () => Effect.succeed({ work: [], publish: Effect.void }),
+        handle: (work: string) => io(async () => {
+          const bytes = await readFile(join(sourcePath, work), "utf8");
+          await Bun.write(join(outputPath, work), bytes);
+          return [];
+        }),
+      });
+      yield* session.submit(["broken", "healthy"]);
+      yield* session.awaitCompletion;
+      const status = yield* session.status;
+      return {
+        state: status.state,
+        pending: status.pending,
+        active: status.active,
+        failed: status.errors.map((error) => error.work),
+        retained: yield* io(() => readFile(join(outputPath, "broken"), "utf8")),
+        independent: yield* io(() => readFile(join(outputPath, "healthy"), "utf8")),
+      };
+    })));
+    // #then drained work remains distinguishable from successful processing
+    expect(observation).toEqual({ state: "complete-with-errors", pending: 0, active: null, failed: ["broken"], retained: "Earlier source", independent: "Independent source" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

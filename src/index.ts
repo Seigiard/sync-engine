@@ -1,8 +1,11 @@
 import { Data, Effect, type Scope } from "effect";
+import { acquireOutputTree, canonicalDestination, OutputOwnershipFailed } from "./ownership.ts";
+export { acquireOutputTree, engineStatePath, OutputOwnershipFailed } from "./ownership.ts";
 import { createWorkScheduler, type WorkOptions, type WorkScheduler } from "./work.ts";
-export { createWorkScheduler, type WorkOptions, type WorkScheduler, type WorkStatus } from "./work.ts";
-import { lstat, mkdir, readdir, realpath } from "node:fs/promises";
-import { dirname, join, relative, resolve, sep } from "node:path";
+export { observeSourcePath, readSourceDirectory, removeAssociatedOutputs, nativeSourceFileSystem, SourceObservationFailed, OutputCleanupFailed, type SourceFileSystem, type SourceObservation, type AssociatedOutputs } from "./source.ts";
+export { createWorkScheduler, type WorkOptions, type WorkScheduler, type WorkStatus, type WorkFailure } from "./work.ts";
+import { lstat, readdir, realpath } from "node:fs/promises";
+import { join, relative, resolve, sep } from "node:path";
 
 export interface SourceEntry {
   readonly path: string;
@@ -20,6 +23,9 @@ export interface InitialPlan<W, E, R> {
 export interface InitialPass<W, E, R> extends WorkOptions<W, E, R> {
   readonly sourcePath: string;
   readonly outputPath: string;
+  readonly statePath?: string;
+  /** Application-owned source policy. Excluded paths are skipped before filesystem traversal. */
+  readonly includeSource?: (relativePath: string) => boolean;
   readonly declare: (entries: readonly SourceEntry[]) => Effect.Effect<InitialPlan<W, E, R>, E, R>;
 }
 
@@ -28,54 +34,7 @@ export class ScanFailed extends Data.TaggedError("ScanFailed")<{
   readonly cause: unknown;
 }> {}
 
-export class OutputOwnershipFailed extends Data.TaggedError("OutputOwnershipFailed")<{
-  readonly path: string;
-  readonly cause: unknown;
-}> {}
-
-/** A Linux advisory lease, shared with a consumer's legacy composition during migration. */
-export function acquireOutputTree(outputPath: string): Effect.Effect<() => Promise<void>, OutputOwnershipFailed> {
-  return Effect.tryPromise({
-    try: async () => {
-      await mkdir(outputPath, { recursive: true });
-      const canonical = await realpath(outputPath);
-      // The persistent lock inode must never be unlinked while owners can acquire it.
-      // EOF releases the lock even if Bun is killed; the holder inherits only the read end.
-      const holder = Bun.spawn([
-        "flock", "-w", "1", "-E", "73", join(canonical, ".sync-engine.lock"),
-        "sh", "-c", "printf 'locked\\n'; read -r _ || :",
-      ], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
-      const reader = holder.stdout.getReader();
-      let released: Promise<void> | undefined;
-      const release = () => released ??= (async () => {
-        await holder.stdin.end();
-        const exit = await holder.exited;
-
-        if (exit !== 0) throw new Error(`Output lock holder exited with ${exit}`);
-      })();
-
-      try {
-        const ready = await reader.read();
-
-        if (ready.done || new TextDecoder().decode(ready.value) !== "locked\n") {
-          await holder.exited;
-          throw new Error(`Output is owned or lock acquisition failed (exit ${holder.exitCode})`);
-        }
-
-        return release;
-      } catch (cause) {
-        await holder.stdin.end();
-        await holder.exited;
-        throw cause;
-      } finally {
-        reader.releaseLock();
-      }
-    },
-    catch: (cause) => new OutputOwnershipFailed({ path: outputPath, cause }),
-  }).pipe(Effect.uninterruptible);
-}
-
-function scanSource(sourcePath: string): Effect.Effect<readonly SourceEntry[], ScanFailed> {
+function scanSource(sourcePath: string, includeSource?: (relativePath: string) => boolean): Effect.Effect<readonly SourceEntry[], ScanFailed> {
   const read = <A>(path: string, run: () => Promise<A>) => Effect.tryPromise({
     try: run,
     catch: (cause) => new ScanFailed({ path, cause }),
@@ -96,6 +55,7 @@ function scanSource(sourcePath: string): Effect.Effect<readonly SourceEntry[], S
 
       for (const name of names) {
         const path = join(folder, name);
+        if (includeSource !== undefined && !includeSource(path)) continue;
         const absolutePath = join(sourcePath, path);
         const info = yield* read(absolutePath, () => lstat(absolutePath));
 
@@ -108,19 +68,6 @@ function scanSource(sourcePath: string): Effect.Effect<readonly SourceEntry[], S
 
     return entries;
   });
-}
-
-async function canonicalDestination(path: string): Promise<string> {
-  try {
-    return await realpath(path);
-  } catch (cause) {
-    if (!(cause instanceof Error) || !("code" in cause) || cause.code !== "ENOENT") throw cause;
-    const parent = dirname(path);
-
-    if (parent === path) throw cause;
-
-    return join(await canonicalDestination(parent), relative(parent, path));
-  }
 }
 
 /** One initial pass; all returned cascades are required before final publication. */
@@ -148,16 +95,22 @@ export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>): Eff
         if (isWithin(insideSource) || isWithin(sourceInsideOutput)) {
           throw new Error("Source and output trees must be disjoint");
         }
+        if (options.statePath !== undefined) {
+          const state = await canonicalDestination(resolve(options.statePath));
+          if (isWithin(relative(source, state)) || isWithin(relative(state, source))) throw new Error("Source and state trees must be disjoint");
+        }
       },
       catch: (cause) => new OutputOwnershipFailed({ path: options.outputPath, cause }),
     }).pipe(Effect.uninterruptible);
 
-    yield* Effect.acquireRelease(acquireOutputTree(options.outputPath), (release) => Effect.promise(release));
-    const entries = yield* scanSource(options.sourcePath);
+    yield* Effect.acquireRelease(acquireOutputTree(options.outputPath, options.statePath), (release) => Effect.promise(release));
+    const entries = yield* scanSource(options.sourcePath, options.includeSource);
     const plan = yield* options.declare(entries);
     const scheduler = yield* createWorkScheduler(options);
     yield* scheduler.submit(plan.work);
     yield* scheduler.awaitCompletion;
+    const completed = yield* scheduler.status;
+    if (completed.errors.length > 0) return yield* Effect.failCause(completed.errors[0]!.cause);
     yield* plan.publish;
     return scheduler;
   });
