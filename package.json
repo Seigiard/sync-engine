@@ -1,7 +1,7 @@
 {
   "name": "@seigiard/sync-engine",
   "description": "Shared Effect 4 synchronization engine: source scans, required work, freshness, live passes and output ownership.",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"

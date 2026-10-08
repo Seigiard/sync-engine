@@ -26,7 +26,8 @@ Without that policy, regular source names are unrestricted.
 until the scope closes. `submit(work)` accepts subsequent application work.
 `awaitCompletion` waits for pending, active and handler-returned required work.
 `status` reports `working`, `complete`, `complete-with-errors`, `failed` or
-`stopped`, with pending count, active work and `errors: [{ work, cause }]`.
+`stopped`, with pending count, one active work item and `errors: [{ work, cause }]`.
+With `concurrency` above one, `active` is a sample of active work, not a full list.
 `complete` means work finished, not verified freshness. Typed failures keep
 independent work running and remain observable after the work drains.
 `failureKey(work)` declares error identity independently from pending coalescing.
@@ -49,7 +50,9 @@ An initial source-read failure fails the pass. Initial handler failures drain
 independent work and prevent final publication. Existing outputs stay available.
 `ScanFailed` and `OutputOwnershipFailed` distinguish engine failures from the
 application's error channel. Handlers own their interruptible preparation and
-safe publication phases. All native filesystem Promise crossings are owned.
+safe publication phases. Later live passes differ from the initial pass: typed
+required-work failures remain visible in status, but final publication still runs
+so consumers can keep serving prior successful results. All native filesystem Promise crossings are owned.
 
 `acquireOutputTree(outputPath, statePath?)` supplies the same lease to legacy consumers
 during migration. It returns an async release function. Effect consumers use
@@ -128,11 +131,11 @@ source/output-check and state-read/write failures. `openFreshness` is the adapte
 for other engine compositions; give it the engine-owned state directory while
 holding the output lease, then use its handle, invalidation and commit operations.
 
-The current temporary bridge stores freshness in a sibling directory named
+By default, freshness is stored in a sibling directory named
 `.sync-engine-state-<digest>`, using the canonical output path's full SHA256.
-Configurable `statePath` and the OPDS `DATA/.sync-engine` composition belong to
-the separate #52 ownership integration. The default external location must remain
-compatible with existing retained records.
+`statePath` overrides that location when an application needs a shared persistent
+state area, such as OPDS `DATA/.sync-engine`. The default external location must
+remain compatible with existing retained records.
 
 ## Consumer shape check
 
@@ -176,8 +179,8 @@ periodic reconciliation to `openSynchronization`.
 
 The application supplies `declare(entries, request)` and the existing handler,
 key and publication contracts. `request` contains `kind`, `force` and relative
-`changedPaths`. Initial declaration prepares the initial publication. Later
-declarations repair in place. The source tree remains authoritative.
+`changedPaths`. Initial declaration prepares the initial publication and uses the
+minimum gate described above. Later declarations repair in place. The source tree remains authoritative.
 Live passes forward `force` and `changedPaths` to freshness-aware admission.
 Declare every applicable result on every pass so processing-version or content
 checks can select rebuilding even when size and mtime do not change.
@@ -189,7 +192,10 @@ The returned session exposes:
 - `awaitCompletion`: await admitted scans, processing, publication and follow-ups.
 - `status`: observe the active pass, pending request and work completion separately.
 
-A pass remains active until required work and final publication finish. Requests
+A pass remains active until required work and final publication finish. Typed
+required-work failures in a later pass produce `complete-with-errors`; final
+publication still runs, prior results for failed work remain, and the errors stay
+visible in `status.work.errors`. Requests
 during that interval guarantee a follow-up. Pending requests combine, retaining
 every dirty path and any forced mode. A post-processing traversal detects source
 size, mtime, kind and membership changes and requests repair before completion.

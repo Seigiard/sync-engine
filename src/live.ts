@@ -86,13 +86,19 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
     let state: LiveStatus<W>["state"] = "working";
     let pending: PassRequest | null = null;
     let active: PassRequest | null = null;
+    let carriedChangedPaths = new Set<string>();
     let failure: Cause.Cause<Failure> | null = null;
+    let terminal = false;
     let completion = Deferred.makeUnsafe<void, Failure>();
     const ready = Deferred.makeUnsafe<void, Failure>();
     const settled = Deferred.makeUnsafe<void>();
 
     const request = (next: PassRequest): PassAdmission => {
       if (state === "stopped") return "rejected";
+      if (terminal) return "rejected";
+      const changedPaths = [...new Set([...carriedChangedPaths, ...next.changedPaths])];
+      carriedChangedPaths = new Set<string>();
+      next = { ...next, changedPaths };
       const busy = !waiting && (opening || active !== null || pending !== null);
       if (state !== "working") completion = Deferred.makeUnsafe<void, Failure>();
       state = "working";
@@ -129,6 +135,7 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
           pending = null;
           active = next;
           const exit = yield* Effect.exit(runPass(live, next));
+          if (Exit.isFailure(exit)) carriedChangedPaths = new Set([...carriedChangedPaths, ...next.changedPaths]);
           active = null;
           failure = Exit.isFailure(exit) ? exit.cause : null;
         }
@@ -188,6 +195,8 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
         Deferred.doneUnsafe(completion, Effect.failCause(cause));
 
         if (fatal) {
+          terminal = true;
+          state = "stopped";
           Deferred.doneUnsafe(ready, Effect.failCause(cause));
           return;
         }

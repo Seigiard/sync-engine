@@ -25,7 +25,7 @@ export interface InitialPlan<W, E, R> {
   readonly minimum?: readonly W[];
   /** The remaining required work. It gates completion, not the minimum. */
   readonly work: readonly W[];
-  /** Runs after all initial work and its required cascades succeed. */
+  /** Runs after all initial work and its required cascades succeed. Later live passes still publish after typed work failures. */
   readonly publish: Effect.Effect<void, E, R>;
 }
 

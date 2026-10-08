@@ -2,8 +2,8 @@ import { test, expect } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Deferred, Effect } from "effect";
-import { openSynchronization, runInitialPass } from "../src/index.ts";
+import { Deferred, Effect, Exit } from "effect";
+import { createWorkScheduler, openSynchronization, runInitialPass } from "../src/index.ts";
 
 const io = <A>(run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: (cause) => new Error(String(cause)) }).pipe(Effect.uninterruptible);
 
@@ -82,7 +82,8 @@ test("independent work can run concurrently without reporting completion early",
     const observation = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const firstEntered = yield* Deferred.make<void>();
       const secondEntered = yield* Deferred.make<void>();
-      const release = yield* Deferred.make<void>();
+      const releaseFirst = yield* Deferred.make<void>();
+      const releaseSecond = yield* Deferred.make<void>();
       const scheduler = yield* openSynchronization({
         sourcePath, outputPath,
         concurrency: 2,
@@ -90,7 +91,7 @@ test("independent work can run concurrently without reporting completion early",
         handle: (work: string) => Effect.gen(function* () {
           if (work === "first") yield* Deferred.succeed(firstEntered, undefined);
           else yield* Deferred.succeed(secondEntered, undefined);
-          yield* Deferred.await(release);
+          yield* Deferred.await(work === "first" ? releaseFirst : releaseSecond);
           yield* io(() => Bun.write(join(outputPath, work), work));
           return [];
         }),
@@ -99,20 +100,135 @@ test("independent work can run concurrently without reporting completion early",
       yield* Deferred.await(firstEntered);
       yield* Deferred.await(secondEntered);
       const before = yield* scheduler.status;
-      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.succeed(releaseFirst, undefined);
+      const afterFirst = yield* Effect.race(scheduler.awaitCompletion.pipe(Effect.as("completed")), Effect.sleep(25).pipe(Effect.as("pending")));
+      yield* Deferred.succeed(releaseSecond, undefined);
       yield* scheduler.awaitCompletion;
       return {
         before: before.state,
+        afterFirst,
         first: yield* io(() => readFile(join(outputPath, "first"), "utf8")),
         second: yield* io(() => readFile(join(outputPath, "second"), "utf8")),
         after: (yield* scheduler.status).state,
       };
     })));
     // #then both entered while completion was still pending
-    expect(observation).toEqual({ before: "working", first: "first", second: "second", after: "complete" });
+    expect(observation).toEqual({ before: "working", afterFirst: "pending", first: "first", second: "second", after: "complete" });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("duplicate unkeyed work can run concurrently without completing after the first copy", async () => {
+  // #given two equal unkeyed jobs guarded by separate barriers
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-duplicate-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  try {
+    // #when both equal jobs run at the same time and only the first is released
+    const observation = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const firstEntered = yield* Deferred.make<void>();
+      const secondEntered = yield* Deferred.make<void>();
+      const releaseFirst = yield* Deferred.make<void>();
+      const releaseSecond = yield* Deferred.make<void>();
+      let seen = 0;
+      const scheduler = yield* openSynchronization({
+        sourcePath, outputPath, concurrency: 2,
+        declare: () => Effect.succeed({ work: [], publish: Effect.void }),
+        handle: (work: string) => Effect.gen(function* () {
+          seen += 1;
+          const index = seen;
+          yield* Deferred.succeed(index === 1 ? firstEntered : secondEntered, undefined);
+          yield* Deferred.await(index === 1 ? releaseFirst : releaseSecond);
+          yield* io(() => Bun.write(join(outputPath, `${work}-${index}`), `${work}-${index}`));
+          return [];
+        }),
+      });
+      yield* scheduler.submit(["x", "x"]);
+      yield* Deferred.await(firstEntered);
+      yield* Deferred.await(secondEntered);
+      yield* Deferred.succeed(releaseFirst, undefined);
+      const afterFirst = yield* Effect.race(scheduler.awaitCompletion.pipe(Effect.as("completed")), Effect.sleep(25).pipe(Effect.as("pending")));
+      yield* Deferred.succeed(releaseSecond, undefined);
+      yield* scheduler.awaitCompletion;
+      return {
+        afterFirst,
+        first: yield* io(() => readFile(join(outputPath, "x-1"), "utf8")),
+        second: yield* io(() => readFile(join(outputPath, "x-2"), "utf8")),
+        state: (yield* scheduler.status).state,
+      };
+    })));
+    // #then public completion waits for the still-held duplicate
+    expect(observation).toEqual({ afterFirst: "pending", first: "x-1", second: "x-2", state: "complete" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a defect stops other workers from enqueueing cascades after failure", async () => {
+  // #given one worker that will defect and another held worker that would return a cascade
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-defect-stop-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  try {
+    // #when the defect fails the scheduler while the other worker is still active
+    const observation = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const heldEntered = yield* Deferred.make<void>();
+      const releaseHeld = yield* Deferred.make<void>();
+      const scheduler = yield* openSynchronization({
+        sourcePath, outputPath, concurrency: 2,
+        declare: () => Effect.succeed({ work: [], publish: Effect.void }),
+        handle: (work: string) => work === "fatal"
+          ? Deferred.await(heldEntered).pipe(Effect.andThen(Effect.die("fatal defect")))
+          : work === "held"
+            ? Effect.gen(function* () {
+                yield* Deferred.succeed(heldEntered, undefined);
+                yield* Deferred.await(releaseHeld);
+                yield* io(() => Bun.write(join(outputPath, "held"), "held"));
+                return ["cascade"];
+              })
+            : io(() => Bun.write(join(outputPath, "cascade"), "cascade")).pipe(Effect.as([])),
+      });
+      yield* scheduler.submit(["fatal", "held"]);
+      const failedExit = yield* Effect.exit(scheduler.awaitCompletion);
+      const failed = Exit.isFailure(failedExit) ? "failed" : "completed";
+      yield* Deferred.succeed(releaseHeld, undefined);
+      yield* Effect.sleep(25);
+      const status = yield* scheduler.status;
+      return {
+        failed,
+        state: status.state,
+        held: yield* io(() => Bun.file(join(outputPath, "held")).exists()),
+        cascade: yield* io(() => Bun.file(join(outputPath, "cascade")).exists()),
+      };
+    })));
+    // #then the active worker's returned cascade is discarded after the defect
+    expect(observation).toEqual({ failed: "failed", state: "failed", held: true, cascade: false });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("non-finite concurrency falls back to one worker", async () => {
+  // #given a scheduler configured from a non-numeric external value
+  const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const handled: string[] = [];
+    const scheduler = yield* createWorkScheduler({
+      concurrency: Number.NaN,
+      handle: (work: string) => Effect.sync(() => {
+        handled.push(work);
+        return [] as string[];
+      }),
+    });
+    // #when work is submitted through the public scheduler
+    yield* scheduler.submit(["refresh"]);
+    const completion = yield* Effect.race(scheduler.awaitCompletion.pipe(Effect.as("completed")), Effect.sleep(25).pipe(Effect.as("pending")));
+    return { completion, handled, state: (yield* scheduler.status).state };
+  })));
+  // #then it is processed by the default single worker instead of hanging
+  expect(result).toEqual({ completion: "completed", handled: ["refresh"], state: "complete" });
 });
 
 test("pending work with an active equivalent key waits while different-key work starts", async () => {

@@ -245,19 +245,21 @@ test("requests made while the first pass is held combine and apply after it", as
               io(async () => {
                 const bytes = await readFile(join(sourcePath, path), "utf8");
 
-                if (hold && path === "first") {
+                if (hold && path === "second") {
                   hold = false;
+                }
+                await Bun.write(join(outputPath, path), bytes);
+                if (path === "second" && !hold) {
                   entered.open();
                   await release.promise;
                 }
-                await Bun.write(join(outputPath, path), bytes);
 
                 return [];
               }),
           });
           yield* io(() => entered.promise);
           // #when a hint and a forced request arrive before the open finished
-          yield* io(() => Bun.write(join(outputPath, "second"), "Damaged old representation"));
+          yield* io(() => Bun.write(join(outputPath, "second"), "Damaged after initial write"));
           const admissions = [yield* session.notify(["first"]), yield* session.requestPass({ force: true })];
           release.open();
           yield* session.ready;

@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Cause, Effect, Exit } from "effect";
-import { openSynchronization, runInitialPass, type InitialPass } from "../src/index.ts";
+import { openFreshness, openSynchronization, runInitialPass, type InitialPass } from "../src/index.ts";
 
 const io = <A>(run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: (cause) => new Error(String(cause)) }).pipe(Effect.uninterruptible);
 const ancient = new Date("2020-01-01T00:00:00Z");
@@ -252,6 +252,37 @@ test("work whose declared source disappeared reaches its handler instead of fail
     }).pipe(Effect.as("completed"), Effect.catchTag("FreshnessFailed", () => Effect.succeed("freshness failed"))));
     // #then absence is the handler's to confirm: it ran, and the pass did not fail on the missing stamp
     expect({ outcome, handled, output: await Bun.file(join(outputPath, "note")).exists() }).toEqual({ outcome: "completed", handled: ["note"], output: false });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed freshness save does not poison later saves in the same session", async () => {
+  // #given a retained-state writer whose state path fails once and then becomes writable again
+  const { root, sourcePath, outputPath, options } = await textTree();
+  const statePath = join(root, "state");
+  try {
+    // #when one save fails before the next real write succeeds
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const freshness = yield* openFreshness(options(), statePath);
+      yield* freshness.handle("note");
+      yield* freshness.commit;
+      yield* io(async () => {
+        await rm(statePath, { recursive: true, force: true });
+        await Bun.write(statePath, "not a directory");
+      });
+      const failed = yield* freshness.invalidateWork(["note"]).pipe(Effect.as("saved"), Effect.catchTag("FreshnessFailed", () => Effect.succeed("failed")));
+      yield* io(async () => {
+        await rm(statePath, { force: true });
+        await mkdir(statePath);
+        await Bun.write(join(sourcePath, "note.txt"), "Recovered source");
+      });
+      yield* freshness.handle("note");
+      yield* freshness.commit;
+      return { failed, text: yield* io(() => readFile(join(outputPath, "note"), "utf8")) };
+    }));
+    // #then the later save is attempted and the recovered source is retained
+    expect(result).toEqual({ failed: "failed", text: "Published: Recovered source" });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

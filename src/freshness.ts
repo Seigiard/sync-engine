@@ -67,11 +67,12 @@ export function openFreshness<W, E, R>(
     const save = () => {
       if (!options.freshness) return Promise.resolve();
       const text = JSON.stringify(Object.fromEntries(records));
-      saving = saving.then(async () => {
+      const next = saving.then(async () => {
         await writeFile(`${path}.tmp`, text);
         await rename(`${path}.tmp`, path);
       });
-      return saving;
+      saving = next.catch(() => {});
+      return next;
     };
     const identity = (descriptor: ResultDescriptor) => JSON.stringify([descriptor.resultKind, descriptor.sourcePaths]);
     const invalidateKey = (key: string) => {

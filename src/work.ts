@@ -33,9 +33,10 @@ export function createWorkScheduler<W, E, R>(options: WorkOptions<W, E, R>): Eff
   return Effect.gen(function* () {
     const wake = yield* Queue.unbounded<void>();
     const pending: W[] = [];
-    const active = new Set<W>();
+    const active: W[] = [];
     const activeKeys = new Set<string>();
-    const concurrency = Math.max(1, Math.floor(options.concurrency ?? 1));
+    const requestedConcurrency = options.concurrency ?? 1;
+    const concurrency = Number.isFinite(requestedConcurrency) ? Math.max(1, Math.floor(requestedConcurrency)) : 1;
     let state: WorkStatus<W>["state"] = "complete";
     let failure: Cause.Cause<E> | undefined;
     const errors: WorkFailure<W, E>[] = [];
@@ -58,6 +59,11 @@ export function createWorkScheduler<W, E, R>(options: WorkOptions<W, E, R>): Eff
       if (index !== -1) errors.splice(index, 1);
     };
 
+    const removeActive = (work: W) => {
+      const index = active.findIndex((item) => Object.is(item, work));
+      if (index !== -1) active.splice(index, 1);
+    };
+
     const takeRunnable = () => {
       const index = pending.findIndex((work) => {
         const key = options.key?.(work);
@@ -73,7 +79,7 @@ export function createWorkScheduler<W, E, R>(options: WorkOptions<W, E, R>): Eff
     };
 
     const completeIfDrained = () => {
-      if (state !== "working" || pending.length > 0 || active.size > 0) return;
+      if (state !== "working" || pending.length > 0 || active.length > 0) return;
 
       state = errors.length === 0 ? "complete" : "complete-with-errors";
       Deferred.doneUnsafe(completion, Effect.void);
@@ -83,27 +89,26 @@ export function createWorkScheduler<W, E, R>(options: WorkOptions<W, E, R>): Eff
       while (true) {
         yield* Queue.take(wake);
         if (state === "failed" || state === "stopped") continue;
-        while (pending.length > 0) {
+        while (state === "working" && pending.length > 0) {
           const work = takeRunnable();
           if (work === undefined) break;
           const activeKey = options.key?.(work);
-          active.add(work);
+          active.push(work);
           if (activeKey !== undefined) activeKeys.add(activeKey);
           const exit = yield* Effect.exit(Effect.suspend(() => options.handle(work)));
+          removeActive(work);
+          if (activeKey !== undefined) activeKeys.delete(activeKey);
+          if (state !== "working") return;
           if (Exit.isFailure(exit)) {
             if (exit.cause.reasons.every((reason) => reason._tag === "Fail")) {
               clearError(work);
               errors.push({ work, cause: exit.cause });
-              active.delete(work);
-              if (activeKey !== undefined) activeKeys.delete(activeKey);
               wakeWorkers();
               completeIfDrained();
               continue;
             }
             failure = exit.cause;
             state = "failed";
-            active.delete(work);
-            if (activeKey !== undefined) activeKeys.delete(activeKey);
             pending.length = 0;
             Deferred.doneUnsafe(completion, Effect.failCause(exit.cause));
             return;
@@ -111,22 +116,20 @@ export function createWorkScheduler<W, E, R>(options: WorkOptions<W, E, R>): Eff
           clearError(work);
           // Required work joins pending before clearing active or reporting completion.
           enqueue(exit.value);
-          active.delete(work);
-          if (activeKey !== undefined) activeKeys.delete(activeKey);
           wakeWorkers();
         }
         completeIfDrained();
       }
     });
 
+    yield* Effect.forEach(Array.from({ length: concurrency }), () => Effect.forkScoped(consume), { discard: true });
     yield* Effect.addFinalizer(() => Effect.sync(() => {
       state = "stopped";
       pending.length = 0;
-      active.clear();
+      active.length = 0;
       activeKeys.clear();
       Deferred.doneUnsafe(completion, Effect.interrupt);
     }));
-    yield* Effect.forEach(Array.from({ length: concurrency }), () => Effect.forkScoped(consume), { discard: true });
 
     return {
       submit: (work) => Effect.suspend(() => {
@@ -141,7 +144,7 @@ export function createWorkScheduler<W, E, R>(options: WorkOptions<W, E, R>): Eff
         return Effect.void;
       }),
       awaitCompletion: Effect.suspend(() => Deferred.await(completion)),
-      status: Effect.sync(() => ({ state, pending: pending.length, active: active.values().next().value ?? null, errors: [...errors] })),
+      status: Effect.sync(() => ({ state, pending: pending.length, active: active[0] ?? null, errors: [...errors] })),
     };
   });
 }

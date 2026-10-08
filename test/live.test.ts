@@ -1,9 +1,9 @@
 import { test, expect } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Cause, Effect } from "effect";
-import { openLiveSynchronization } from "../src/index.ts";
+import { Cause, Effect, Exit } from "effect";
+import { openLiveSynchronization, startLiveSynchronization } from "../src/index.ts";
 
 const io = <A>(run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: (cause) => new Error(String(cause)) }).pipe(Effect.uninterruptible);
 
@@ -191,6 +191,115 @@ test("a failed pass exposes its failure while earlier output stays available", a
     })));
     // #then the failure is a public fact and the earlier publication is intact
     expect(result).toEqual({ outcome: "scan failed", state: "failed", failure: true, reference: "Original publication" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("typed required failures still publish prior results and remain visible in status", async () => {
+  // #given a live session with a previously published required result
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-typed-failure-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "document"), "Original source");
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* openLiveSynchronization({
+        sourcePath, outputPath,
+        declare: () => Effect.succeed({
+          work: ["document"],
+          publish: io(async () => Bun.write(join(outputPath, "reference"), await readFile(join(outputPath, "document"), "utf8"))),
+        }),
+        handle: (path: string) => io(() => readFile(join(sourcePath, path), "utf8")).pipe(Effect.flatMap((bytes) =>
+          bytes === "Broken source"
+            ? Effect.fail(new Error("Cannot prepare document"))
+            : io(async () => { await Bun.write(join(outputPath, path), `Prepared: ${bytes}`); return []; }),
+        )),
+      });
+      yield* io(() => Bun.write(join(sourcePath, "document"), "Broken source"));
+      // #when required work fails with a typed error during a later live pass
+      yield* session.requestPass({ force: true });
+      yield* session.awaitCompletion;
+      const status = yield* session.status;
+      return {
+        state: status.state,
+        errors: status.work.errors.map((error) => error.work),
+        result: yield* io(() => readFile(join(outputPath, "document"), "utf8")),
+        reference: yield* io(() => readFile(join(outputPath, "reference"), "utf8")),
+      };
+    })));
+    // #then the pass published with visible errors and retained the prior required result
+    expect(result).toEqual({ state: "complete-with-errors", errors: ["document"], result: "Prepared: Original source", reference: "Prepared: Original source" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("fatal first-pass failure rejects later admission instead of starting unreachable work", async () => {
+  // #given a live handle whose first pass cannot recover
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-fatal-open-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* startLiveSynchronization({
+        sourcePath, outputPath,
+        declare: () => Effect.succeed({ work: ["document"], publish: Effect.void }),
+        handle: (_path: string) => Effect.succeed([]),
+      });
+      const readyExit = yield* Effect.exit(session.ready);
+      const ready = Exit.isFailure(readyExit) ? "failed" : "ready";
+      // #when the application asks for another pass after the fatal first-pass failure
+      const admission = yield* session.requestPass();
+      const status = yield* session.status;
+      return { ready, admission, state: status.state };
+    })));
+    // #then no unreachable pass is reported as started
+    expect(result).toEqual({ ready: "failed", admission: "rejected", state: "stopped" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("watcher hints survive a failed pass that stops before freshness invalidation", async () => {
+  // #given a retained metadata result and a replacement with equal metadata
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-hint-carry-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const stamp = new Date("2020-01-01T00:00:00Z");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "note.txt"), "Original");
+  await utimes(join(sourcePath, "note.txt"), stamp, stamp);
+  let failDeclare = false;
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* openLiveSynchronization({
+        sourcePath, outputPath,
+        freshness: { describe: () => ({ sourcePaths: ["note.txt"], resultKind: "note", processingVersion: "v1", outputPaths: ["note.txt"] }) },
+        declare: (_entries, request) => failDeclare
+          ? Effect.fail(new Error(`declare failed for ${request.changedPaths.join(",")}`))
+          : Effect.succeed({ work: ["note.txt"], publish: Effect.void }),
+        handle: (path: string) => io(async () => {
+          await Bun.write(join(outputPath, path), await readFile(join(sourcePath, path), "utf8"));
+          return [];
+        }),
+      });
+      yield* io(async () => {
+        await Bun.write(join(sourcePath, "note.txt"), "Changed!");
+        await utimes(join(sourcePath, "note.txt"), stamp, stamp);
+      });
+      failDeclare = true;
+      // #when the hinted pass fails before it can invalidate freshness, then a plain retry runs
+      yield* session.notify(["note.txt"]);
+      const failed = yield* Effect.exit(session.awaitCompletion);
+      failDeclare = false;
+      yield* session.requestPass();
+      yield* session.awaitCompletion;
+      return { failed: Exit.isFailure(failed), text: yield* io(() => readFile(join(outputPath, "note.txt"), "utf8")) };
+    })));
+    // #then the retry still uses the carried watcher hint and rebuilds the equal-stamp result
+    expect(result).toEqual({ failed: true, text: "Changed!" });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
