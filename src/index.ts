@@ -4,6 +4,7 @@ export { acquireOutputTree, engineStatePath, OutputOwnershipFailed } from "./own
 import { createWorkScheduler, type WorkOptions, type WorkScheduler } from "./work.ts";
 export { observeSourcePath, readSourceDirectory, removeAssociatedOutputs, nativeSourceFileSystem, SourceObservationFailed, OutputCleanupFailed, type SourceFileSystem, type SourceObservation, type AssociatedOutputs } from "./source.ts";
 export { createWorkScheduler, type WorkOptions, type WorkScheduler, type WorkStatus, type WorkFailure } from "./work.ts";
+export { openLiveSynchronization, type LiveOptions, type LiveSynchronization, type PassRequest, type PassAdmission, type LiveStatus } from "./live.ts";
 import { lstat, readdir, realpath } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 
@@ -34,7 +35,7 @@ export class ScanFailed extends Data.TaggedError("ScanFailed")<{
   readonly cause: unknown;
 }> {}
 
-function scanSource(sourcePath: string, includeSource?: (relativePath: string) => boolean): Effect.Effect<readonly SourceEntry[], ScanFailed> {
+export function scanSource(sourcePath: string, includeSource?: (relativePath: string) => boolean): Effect.Effect<readonly SourceEntry[], ScanFailed> {
   const read = <A>(path: string, run: () => Promise<A>) => Effect.tryPromise({
     try: run,
     catch: (cause) => new ScanFailed({ path, cause }),
