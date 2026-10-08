@@ -1,4 +1,6 @@
-import { Data, Effect } from "effect";
+import { Data, Effect, type Scope } from "effect";
+import { createWorkScheduler, type WorkOptions, type WorkScheduler } from "./work.ts";
+export { createWorkScheduler, type WorkOptions, type WorkScheduler, type WorkStatus } from "./work.ts";
 import { lstat, mkdir, readdir, realpath } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
@@ -15,11 +17,10 @@ export interface InitialPlan<W, E, R> {
   readonly publish: Effect.Effect<void, E, R>;
 }
 
-export interface InitialPass<W, E, R> {
+export interface InitialPass<W, E, R> extends WorkOptions<W, E, R> {
   readonly sourcePath: string;
   readonly outputPath: string;
   readonly declare: (entries: readonly SourceEntry[]) => Effect.Effect<InitialPlan<W, E, R>, E, R>;
-  readonly handle: (work: W) => Effect.Effect<readonly W[], E, R>;
 }
 
 export class ScanFailed extends Data.TaggedError("ScanFailed")<{
@@ -124,7 +125,12 @@ async function canonicalDestination(path: string): Promise<string> {
 
 /** One initial pass; all returned cascades are required before final publication. */
 export function runInitialPass<W, E, R>(options: InitialPass<W, E, R>): Effect.Effect<void, E | ScanFailed | OutputOwnershipFailed, R> {
-  return Effect.scoped(Effect.gen(function* () {
+  return Effect.scoped(openSynchronization(options).pipe(Effect.asVoid));
+}
+
+/** Completes initial publication, then keeps the lease and scheduler in the caller's scope. */
+export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>): Effect.Effect<WorkScheduler<W, E>, E | ScanFailed | OutputOwnershipFailed, R | Scope.Scope> {
+  return Effect.gen(function* () {
     // Validate before creating output directories, including aliases through existing symlinks.
     const source = yield* Effect.tryPromise({
       try: () => realpath(options.sourcePath),
@@ -149,14 +155,10 @@ export function runInitialPass<W, E, R>(options: InitialPass<W, E, R>): Effect.E
     yield* Effect.acquireRelease(acquireOutputTree(options.outputPath), (release) => Effect.promise(release));
     const entries = yield* scanSource(options.sourcePath);
     const plan = yield* options.declare(entries);
-    const pending = [...plan.work];
-
-    while (pending.length > 0) {
-      const work = pending.shift()!;
-      const cascades = yield* options.handle(work);
-      pending.push(...cascades);
-    }
-
+    const scheduler = yield* createWorkScheduler(options);
+    yield* scheduler.submit(plan.work);
+    yield* scheduler.awaitCompletion;
     yield* plan.publish;
-  }));
+    return scheduler;
+  });
 }

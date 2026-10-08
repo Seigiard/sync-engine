@@ -8,7 +8,7 @@ Repository identity: `Seigiard/sync-engine`.
 The library owns synchronization mechanisms. Applications own domain processing and publication requirements.
 Bun on Linux/Docker and Effect 4 are the supported execution boundary.
 
-## First release: 0.1.0
+## Local package: 0.2.0
 
 `runInitialPass({ sourcePath, outputPath, declare, handle })` returns an Effect.
 It scans regular source paths and directories, with relative path identity,
@@ -17,6 +17,26 @@ must be disjoint. Applications declare an `InitialPlan`: initial work and a
 final publication Effect. Each handler returns required cascade work. The
 engine drains that work before final publication. Applications keep domain
 classification, extraction, rendering, path projection and publication rules.
+
+`openSynchronization(options)` runs the same initial pass and returns a scoped
+`WorkScheduler`. Keep it inside `Effect.scoped`; its output lease remains held
+until the scope closes. `submit(work)` accepts subsequent application work.
+`awaitCompletion` waits for pending, active and handler-returned required work.
+`status` reports `working`, `complete`, `failed` or `stopped`, with pending work
+count and active work. `complete` means work finished, not verified freshness.
+
+Applications can supply `key(work)` for refresh requests. A defined key combines
+equivalent pending work and moves it behind intervening work. An active request
+is separate: another request schedules one pending follow-up. Undefined keys
+retain each request. Results publish as handlers finish; the scheduler neither
+stages a whole-tree snapshot nor observes output writes.
+
+`createWorkScheduler({ handle, key })` exposes the same scoped work mechanism
+without scanning or acquiring an output lease. Use `openSynchronization` for
+an application output tree. A handler failure stops this scheduler, fails its
+completion wait and rejects further submission with that cause. Independent
+failure recovery is a later slice. Scope close joins the owned consumer fiber
+before releasing the output lease. Handlers retain their safe publication phases.
 
 The initial pass stops on a read or handler failure. It does not clear outputs.
 `ScanFailed` and `OutputOwnershipFailed` distinguish engine failures from the
@@ -49,8 +69,8 @@ optional-work readiness, concurrency and reconciliation are later slices.
 ## Verify and pack
 
 ```sh
-COMPOSE_PROJECT_NAME=opds49-50 docker compose -f docker-compose.test.yml run --build --rm engine-test
-COMPOSE_PROJECT_NAME=opds49-50 docker compose -f docker-compose.test.yml down
+COMPOSE_PROJECT_NAME=opds49-51 docker compose -f docker-compose.test.yml run --build --rm engine-test
+COMPOSE_PROJECT_NAME=opds49-51 docker compose -f docker-compose.test.yml down
 bun pm pack
 ```
 
