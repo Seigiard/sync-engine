@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Effect, Exit } from "effect";
@@ -96,6 +96,24 @@ test("explicit in-output bookkeeping shares canonical aliases and is excluded fr
     const cleanup = await Effect.runPromiseExit(removeAssociatedOutputs({ sourcePath, outputPath, statePath, sourceRelativePath: "gone", outputs: [".sync-engine"] }));
     // #then configuration preserves canonical identity and protects the state itself
     expect({ canonical, rejected: Exit.isFailure(cleanup), saved: await readFile(join(statePath, "saved"), "utf8") }).toEqual({ canonical: statePath, rejected: true, saved: "Persistent engine state" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a default state area overlapping the source root is rejected before source writes", async () => {
+  // #given a legal source-root name that happens to equal the default external state area
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-state-source-"));
+  const outputPath = join(root, "output");
+  await mkdir(outputPath);
+  const sourcePath = await Effect.runPromise(engineStatePath(outputPath));
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "source.txt"), "Original source");
+  try {
+    // #when a public engine session tries to use that overlapping state layout
+    const exit = await Effect.runPromiseExit(Effect.scoped(openSynchronization({ sourcePath, outputPath, declare: () => Effect.succeed({ work: [], publish: Effect.void }), handle: (_work: string) => Effect.succeed([]) })));
+    // #then source authority remains read-only, including before a scan begins
+    expect({ rejected: Exit.isFailure(exit), sourceNames: await readdir(sourcePath), bytes: await readFile(join(sourcePath, "source.txt"), "utf8") }).toEqual({ rejected: true, sourceNames: ["source.txt"], bytes: "Original source" });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

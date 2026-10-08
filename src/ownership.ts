@@ -12,7 +12,7 @@ export class OutputOwnershipFailed extends Data.TaggedError("OutputOwnershipFail
 export function engineStatePath(outputPath: string, statePath?: string): Effect.Effect<string, OutputOwnershipFailed> {
   return Effect.tryPromise({
     try: async () => {
-      const canonical = await realpath(outputPath);
+      const canonical = await canonicalDestination(resolve(outputPath));
       if (statePath !== undefined) {
         const state = await canonicalDestination(resolve(statePath));
         if (state === canonical) throw new Error("State area must be distinct from the output root");

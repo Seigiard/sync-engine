@@ -8,7 +8,7 @@ Repository identity: `Seigiard/sync-engine`.
 The library owns synchronization mechanisms. Applications own domain processing and publication requirements.
 Bun on Linux/Docker and Effect 4 are the supported execution boundary.
 
-## Local package: 0.3.0
+## Local package: 0.3.1
 
 `runInitialPass({ sourcePath, outputPath, declare, handle })` returns an Effect.
 It scans regular source paths and directories, with relative path identity,
@@ -83,8 +83,37 @@ cascades after removal. No object identity persists across source moves.
 
 The exact `effect@4.0.1` peer keeps one runtime identity. The tarball ships
 TypeScript source for Bun; it contains neither node_modules nor bundled Effect.
-This local release is not an npm publication. Watchers, freshness, resync,
+This local release is not an npm publication. Watchers, resync,
 optional-work readiness, concurrency and reconciliation are later slices.
+
+## Freshness
+
+Supply optional `freshness: { describe(work), check? }` on `InitialPass`.
+`describe` returns `{ sourcePaths, resultKind, processingVersion, outputPaths }`
+for cacheable work, or `undefined` for unconditional work. Paths are relative
+to the source/output roots. Applications own result kinds and processing
+versions; the engine package version is not part of result freshness.
+
+The default `check: "metadata"` compares source size, mtime and processing
+version, and requires the declared outputs to exist. `check: "content"`
+additionally reads and hashes regular files. Without a watcher hint, metadata
+checks can miss content replacements that preserve both size and mtime.
+
+`submit(work)` explicitly reprocesses its described results. Ordinary pass
+admission uses `submit(work, { force: false, changedPaths: [] })`.
+Source-relative `changedPaths` hints invalidate affected saved results even
+when metadata matches. A hint during active work also prevents that earlier
+read from being recorded as current. `force: true` bypasses all retained freshness.
+Returned required work invalidates its dependent result, so a changed upstream
+cannot shortcut the publication it requires.
+
+Dirty records are removed before processing. Only a completed successful batch
+records new freshness; a failure or interruption leaves work eligible for replay.
+Sources are checked before/after processing and again at successful completion.
+The output lease serializes retained-state access. `FreshnessFailed` reports
+source/output-check and state-read/write failures. `openFreshness` is the adapter
+for other engine compositions; give it the engine-owned state directory while
+holding the output lease, then use its handle, invalidation and commit operations.
 
 ## Consumer shape check
 
