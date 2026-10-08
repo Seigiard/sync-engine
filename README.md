@@ -19,7 +19,7 @@ engine drains that work before final publication. Applications keep domain
 classification, extraction, rendering, path projection and publication rules.
 
 `openSynchronization(options)` runs the same initial pass and returns a scoped
-`WorkScheduler`. Keep it inside `Effect.scoped`; its output lease remains held
+`Synchronization`, compatible with `WorkScheduler`. Keep it inside `Effect.scoped`; its output lease remains held
 until the scope closes. `submit(work)` accepts subsequent application work.
 `awaitCompletion` waits for pending, active and handler-returned required work.
 `status` reports `working`, `complete`, `failed` or `stopped`, with pending work
@@ -55,8 +55,9 @@ same lock. Separate applications must use separate, non-overlapping output roots
 
 The exact `effect@4.0.1` peer keeps one runtime identity. The tarball ships
 TypeScript source for Bun; it contains neither node_modules nor bundled Effect.
-This local release is not an npm publication. Watchers, resync,
-optional-work readiness, concurrency and reconciliation are later slices.
+This local release is not an npm publication. Applications own watcher transport;
+the live API owns resync scheduling and reconciliation. Optional-work readiness
+and concurrency are later slices.
 
 ## Freshness
 
@@ -87,6 +88,12 @@ source/output-check and state-read/write failures. `openFreshness` is the adapte
 for other engine compositions; give it the engine-owned state directory while
 holding the output lease, then use its handle, invalidation and commit operations.
 
+The current temporary bridge stores freshness in a sibling directory named
+`.sync-engine-state-<digest>`, using the canonical output path's full SHA256.
+Configurable `statePath` and the OPDS `DATA/.sync-engine` composition belong to
+the separate #52 ownership integration. The default external location must remain
+compatible with existing retained records.
+
 ## Consumer shape check
 
 - OPDS: required book/folder cascades precede root publication.
@@ -106,7 +113,8 @@ bun pm pack
 OPDS's `docs/agents/shared-sync-engine.md` records the integration reproduction
 command and temporary lifecycle selection seam. Copy a versioned packed
 artifact to that consumer; direct checkout imports are not the release boundary.
-# Live synchronization
+
+## Live synchronization
 
 `openLiveSynchronization(options)` retains the scoped output lease and performs
 the initial publication. It adds engine-owned source scans, pass scheduling and
@@ -116,6 +124,9 @@ The application supplies `declare(entries, request)` and the existing handler,
 key and publication contracts. `request` contains `kind`, `force` and relative
 `changedPaths`. Initial declaration prepares the initial publication. Later
 declarations repair in place. The source tree remains authoritative.
+Live passes forward `force` and `changedPaths` to freshness-aware admission.
+Declare every applicable result on every pass so processing-version or content
+checks can select rebuilding even when size and mtime do not change.
 
 The returned session exposes:
 
