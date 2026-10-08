@@ -116,7 +116,7 @@ export function openLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>):
       pending = null;
       Deferred.doneUnsafe(completion, Effect.interrupt);
     }));
-    yield* Effect.forkScoped(consume);
+    yield* Effect.forkScoped(consume.pipe(Effect.ensuring(Effect.sync(() => { active = null; }))));
 
     // An initial traversal is not a snapshot either.
     const afterInitial = yield* scanSource(options.sourcePath, options.includeSource);
