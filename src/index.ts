@@ -4,6 +4,9 @@ export { createWorkScheduler, type WorkOptions, type WorkScheduler, type WorkSta
 export { openLiveSynchronization, type LiveOptions, type LiveSynchronization, type PassRequest, type PassAdmission, type LiveStatus } from "./live.ts";
 import { lstat, mkdir, readdir, realpath } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { createHash } from "node:crypto";
+import { openFreshness, type FreshnessOptions, type FreshnessFailed, type WorkInput } from "./freshness.ts";
+export { openFreshness, FreshnessFailed, type FreshnessOptions, type ResultDescriptor, type WorkInput } from "./freshness.ts";
 
 export interface SourceEntry {
   readonly path: string;
@@ -23,6 +26,11 @@ export interface InitialPass<W, E, R> extends WorkOptions<W, E, R> {
   readonly outputPath: string;
   readonly includeSource?: (relativePath: string) => boolean;
   readonly declare: (entries: readonly SourceEntry[]) => Effect.Effect<InitialPlan<W, E, R>, E, R>;
+  readonly freshness?: FreshnessOptions<W>;
+}
+
+export interface Synchronization<W, E> extends WorkScheduler<W, E> {
+  readonly submit: (work: readonly W[], input?: WorkInput) => Effect.Effect<void, E>;
 }
 
 export class ScanFailed extends Data.TaggedError("ScanFailed")<{
@@ -127,12 +135,12 @@ async function canonicalDestination(path: string): Promise<string> {
 }
 
 /** One initial pass; all returned cascades are required before final publication. */
-export function runInitialPass<W, E, R>(options: InitialPass<W, E, R>): Effect.Effect<void, E | ScanFailed | OutputOwnershipFailed, R> {
+export function runInitialPass<W, E, R>(options: InitialPass<W, E, R>): Effect.Effect<void, E | FreshnessFailed | ScanFailed | OutputOwnershipFailed, R> {
   return Effect.scoped(openSynchronization(options).pipe(Effect.asVoid));
 }
 
 /** Completes initial publication, then keeps the lease and scheduler in the caller's scope. */
-export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>): Effect.Effect<WorkScheduler<W, E>, E | ScanFailed | OutputOwnershipFailed, R | Scope.Scope> {
+export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>): Effect.Effect<Synchronization<W, E | FreshnessFailed>, E | FreshnessFailed | ScanFailed | OutputOwnershipFailed, R | Scope.Scope> {
   return Effect.gen(function* () {
     // Validate before creating output directories, including aliases through existing symlinks.
     const source = yield* Effect.tryPromise({
@@ -158,10 +166,18 @@ export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>): Eff
     yield* Effect.acquireRelease(acquireOutputTree(options.outputPath), (release) => Effect.promise(release));
     const entries = yield* scanSource(options.sourcePath, options.includeSource);
     const plan = yield* options.declare(entries);
-    const scheduler = yield* createWorkScheduler(options);
+    const canonicalOutput = yield* Effect.promise(() => realpath(options.outputPath)).pipe(Effect.uninterruptible);
+    const statePath = join(dirname(canonicalOutput), `.sync-engine-state-${createHash("sha256").update(canonicalOutput).digest("hex")}`);
+    const freshness = yield* openFreshness(options, statePath);
+    const scheduler = yield* createWorkScheduler({ ...options, handle: freshness.handle });
     yield* scheduler.submit(plan.work);
     yield* scheduler.awaitCompletion;
     yield* plan.publish;
-    return scheduler;
+    yield* freshness.commit;
+    return {
+      ...scheduler,
+      submit: (work: readonly W[], input?: WorkInput) => (input === undefined ? freshness.invalidateWork(work) : freshness.invalidate(input)).pipe(Effect.andThen(scheduler.submit(work))),
+      awaitCompletion: scheduler.awaitCompletion.pipe(Effect.andThen(freshness.commit)),
+    };
   });
 }

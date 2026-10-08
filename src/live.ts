@@ -1,5 +1,5 @@
 import { Deferred, Effect, Exit, Queue, type Cause, type Scope } from "effect";
-import { openSynchronization, scanSource, type InitialPass, type InitialPlan, type SourceEntry, type ScanFailed, type OutputOwnershipFailed } from "./index.ts";
+import { openSynchronization, scanSource, type InitialPass, type InitialPlan, type SourceEntry, type ScanFailed, type OutputOwnershipFailed, type FreshnessFailed } from "./index.ts";
 import type { WorkStatus } from "./work.ts";
 
 export interface PassRequest {
@@ -44,7 +44,7 @@ function differences(before: readonly SourceEntry[], after: readonly SourceEntry
 }
 
 /** Owns scan, processing, required publication and follow-up as one pass. */
-export function openLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>): Effect.Effect<LiveSynchronization<W, E>, E | ScanFailed | OutputOwnershipFailed, R | Scope.Scope> {
+export function openLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>): Effect.Effect<LiveSynchronization<W, E | FreshnessFailed>, E | FreshnessFailed | ScanFailed | OutputOwnershipFailed, R | Scope.Scope> {
   return Effect.gen(function* () {
     let baseline: readonly SourceEntry[] = [];
     const scheduler = yield* openSynchronization({
@@ -54,20 +54,18 @@ export function openLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>):
         return options.declare(entries, { kind: "initial", force: false, changedPaths: [] });
       },
     });
-    // The optional pass input is accepted by freshness-aware schedulers; older schedulers ignore it.
-    const submitPass: (work: readonly W[], request: PassRequest) => Effect.Effect<void, E> = scheduler.submit;
     const wake = yield* Queue.unbounded<void>();
     let state: LiveStatus<W>["state"] = "complete";
     let pending: PassRequest | null = null;
     let active: PassRequest | null = null;
-    let failure: Cause.Cause<E | ScanFailed> | null = null;
-    let completion = Deferred.makeUnsafe<void, E | ScanFailed>();
+    let failure: Cause.Cause<E | FreshnessFailed | ScanFailed> | null = null;
+    let completion = Deferred.makeUnsafe<void, E | FreshnessFailed | ScanFailed>();
     Deferred.doneUnsafe(completion, Effect.void);
 
     const request = (next: PassRequest): PassAdmission => {
       if (state === "stopped") return "rejected";
       const busy = active !== null || pending !== null;
-      if (state !== "working") completion = Deferred.makeUnsafe<void, E | ScanFailed>();
+      if (state !== "working") completion = Deferred.makeUnsafe<void, E | FreshnessFailed | ScanFailed>();
       state = "working";
       pending = pending === null ? next : {
         kind: pending.kind === "resync" || next.kind === "resync" ? "resync" : next.kind,
@@ -83,7 +81,7 @@ export function openLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>):
       const changedPaths = [...new Set([...requested.changedPaths, ...differences(baseline, entries)])];
       active = { ...requested, changedPaths };
       const plan = yield* options.declare(entries, active);
-      yield* submitPass(plan.work, active);
+      yield* scheduler.submit(plan.work, active);
       yield* scheduler.awaitCompletion;
       yield* plan.publish;
       baseline = entries;
