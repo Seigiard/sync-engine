@@ -173,3 +173,23 @@ processing; traversal does not provide a filesystem snapshot.
 
 `reconcileIntervalMs` enables the scoped timer; zero disables it. Scope closure
 stops the timer and pass consumer before the work scheduler releases its lease.
+
+## Cooperative shutdown and restart
+
+Close the session's Effect scope to stop it. Admission closes immediately,
+pending work and follow-ups are discarded, and traversal and reconciliation stop.
+The scope interrupts preparation and joins the owned consumer before releasing
+output ownership. Native filesystem reads finish before cancellation proceeds.
+Handlers own command termination, temporary resources and publication boundaries.
+Use interruptible preparation and an uninterruptible publication phase to finish
+related writes once publication starts. Interruption remains an Effect interruption.
+
+The public state becomes `stopped` when admission closes. Active work can remain
+visible while cleanup or safe publication finishes. After scope closure completes,
+active work and the active pass are null. A stopped session rejects later admission.
+
+The queue is in memory. A new scoped session scans sources and repeats unfinished
+work through successful-only freshness. A write without recorded success is
+eligible for replay; application handlers must tolerate that replay. Cooperative
+shutdown preserves the handler's declared boundary, not atomic safety against
+SIGKILL, a shutdown deadline, or power loss at every intermediate write.

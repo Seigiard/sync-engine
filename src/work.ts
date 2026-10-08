@@ -90,7 +90,7 @@ export function createWorkScheduler<W, E, R>(options: WorkOptions<W, E, R>): Eff
       pending.length = 0;
       Deferred.doneUnsafe(completion, Effect.interrupt);
     }));
-    yield* Effect.forkScoped(consume);
+    yield* Effect.forkScoped(consume.pipe(Effect.ensuring(Effect.sync(() => { active = null; }))));
 
     return {
       submit: (work) => Effect.suspend(() => {
