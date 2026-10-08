@@ -71,6 +71,50 @@ test("required downstream publication keeps public completion working", async ()
   }
 });
 
+test("independent work can run concurrently without reporting completion early", async () => {
+  // #given two independent jobs guarded by separate barriers
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-concurrent-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  try {
+    // #when a scheduler with two permits receives both jobs
+    const observation = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const firstEntered = yield* Deferred.make<void>();
+      const secondEntered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const scheduler = yield* openSynchronization({
+        sourcePath, outputPath,
+        concurrency: 2,
+        declare: () => Effect.succeed({ work: [], publish: Effect.void }),
+        handle: (work: string) => Effect.gen(function* () {
+          if (work === "first") yield* Deferred.succeed(firstEntered, undefined);
+          else yield* Deferred.succeed(secondEntered, undefined);
+          yield* Deferred.await(release);
+          yield* io(() => Bun.write(join(outputPath, work), work));
+          return [];
+        }),
+      });
+      yield* scheduler.submit(["first", "second"]);
+      yield* Deferred.await(firstEntered);
+      yield* Deferred.await(secondEntered);
+      const before = yield* scheduler.status;
+      yield* Deferred.succeed(release, undefined);
+      yield* scheduler.awaitCompletion;
+      return {
+        before: before.state,
+        first: yield* io(() => readFile(join(outputPath, "first"), "utf8")),
+        second: yield* io(() => readFile(join(outputPath, "second"), "utf8")),
+        after: (yield* scheduler.status).state,
+      };
+    })));
+    // #then both entered while completion was still pending
+    expect(observation).toEqual({ before: "working", first: "first", second: "second", after: "complete" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("an equivalent refresh requested while active publishes the later source", async () => {
   // #given a real mutable source and a held refresh that already read its earlier bytes
   const root = await mkdtemp(join(tmpdir(), "sync-engine-active-"));

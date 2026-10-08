@@ -169,6 +169,7 @@ test("the reconcile timer reopens a failed session without any request", async (
             await Bun.write(join(sourcePath, "document"), "Timer publication");
           });
           const repaired = yield* io(() => waitFor(async () => (await readFile(join(outputPath, "reference"), "utf8")) === "Timer publication"));
+          yield* io(() => waitFor(async () => (await Effect.runPromise(session.status)).failure === null));
           const status = yield* session.status;
 
           return { repaired, failure: status.failure };
