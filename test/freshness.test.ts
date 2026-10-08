@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Cause, Effect, Exit } from "effect";
+import { Cause, Effect, Exit, Scope } from "effect";
 import { openFreshness, openSynchronization, runInitialPass, type InitialPass } from "../src/index.ts";
 
 const io = <A>(run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: (cause) => new Error(String(cause)) }).pipe(Effect.uninterruptible);
@@ -283,6 +283,33 @@ test("a failed freshness save does not poison later saves in the same session", 
     }));
     // #then the later save is attempted and the recovered source is retained
     expect(result).toEqual({ failed: "failed", text: "Published: Recovered source" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a closed synchronization handle cannot rewrite retained freshness", async () => {
+  // #given a scoped session that recorded freshness in an explicit state directory
+  const { root, options } = await textTree();
+  const statePath = join(root, "state");
+  try {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const scope = yield* Scope.make();
+      const session = yield* openSynchronization({ ...options(), statePath }).pipe(Scope.provide(scope));
+      const before = yield* io(() => readFile(join(statePath, "freshness.json"), "utf8"));
+      yield* Scope.close(scope, Exit.void);
+      // #when a stale handle is used after its scope closed
+      const submit = yield* Effect.exit(session.submit(["note"], { force: true }));
+      const completion = yield* Effect.exit(session.awaitCompletion);
+      const after = yield* io(() => readFile(join(statePath, "freshness.json"), "utf8"));
+      return {
+        submitInterrupted: Exit.isFailure(submit) && Cause.hasInterruptsOnly(submit.cause),
+        completionInterrupted: Exit.isFailure(completion) && Cause.hasInterruptsOnly(completion.cause),
+        unchanged: before === after,
+      };
+    }));
+    // #then it is rejected before invalidation or commit can save stale state
+    expect(result).toEqual({ submitInterrupted: true, completionInterrupted: true, unchanged: true });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

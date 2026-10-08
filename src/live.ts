@@ -60,7 +60,7 @@ function differences(before: readonly SourceEntry[], after: readonly SourceEntry
   const changed = new Set<string>();
   for (const entry of after) {
     const old = previous.get(entry.path);
-    if (!old || old.kind !== entry.kind || old.size !== entry.size || old.mtimeMs !== entry.mtimeMs) changed.add(entry.path);
+    if (!old || old.kind !== entry.kind || (entry.kind === "file" && (old.size !== entry.size || old.mtimeMs !== entry.mtimeMs))) changed.add(entry.path);
     previous.delete(entry.path);
   }
   for (const path of previous.keys()) changed.add(path);
@@ -192,11 +192,13 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
         const fatal = options.recovery === undefined || availability === null;
         // Settle the flags before any Deferred: a waiter may resume inline and must see a consistent session.
         waiting = !fatal;
-        Deferred.doneUnsafe(completion, Effect.failCause(cause));
-
         if (fatal) {
           terminal = true;
           state = "stopped";
+        }
+        Deferred.doneUnsafe(completion, Effect.failCause(cause));
+
+        if (fatal) {
           Deferred.doneUnsafe(ready, Effect.failCause(cause));
           return;
         }

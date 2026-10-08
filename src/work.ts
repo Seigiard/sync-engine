@@ -64,14 +64,14 @@ export function createWorkScheduler<W, E, R>(options: WorkOptions<W, E, R>): Eff
       if (index !== -1) active.splice(index, 1);
     };
 
-    const takeRunnable = () => {
+    const takeRunnable = (): { readonly found: true; readonly work: W } | { readonly found: false } => {
       const index = pending.findIndex((work) => {
         const key = options.key?.(work);
 
         return key === undefined || !activeKeys.has(key);
       });
 
-      return index === -1 ? undefined : pending.splice(index, 1)[0];
+      return index === -1 ? { found: false } : { found: true, work: pending.splice(index, 1)[0]! };
     };
 
     const wakeWorkers = () => {
@@ -90,8 +90,9 @@ export function createWorkScheduler<W, E, R>(options: WorkOptions<W, E, R>): Eff
         yield* Queue.take(wake);
         if (state === "failed" || state === "stopped") continue;
         while (state === "working" && pending.length > 0) {
-          const work = takeRunnable();
-          if (work === undefined) break;
+          const runnable = takeRunnable();
+          if (!runnable.found) break;
+          const work = runnable.work;
           const activeKey = options.key?.(work);
           active.push(work);
           if (activeKey !== undefined) activeKeys.add(activeKey);

@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, utimes } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Cause, Effect, Exit } from "effect";
@@ -257,6 +257,126 @@ test("fatal first-pass failure rejects later admission instead of starting unrea
     })));
     // #then no unreachable pass is reported as started
     expect(result).toEqual({ ready: "failed", admission: "rejected", state: "stopped" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("fatal first-pass completion waiters resume with terminal admission already closed", async () => {
+  // #given a live handle whose unrecoverable first pass is awaited through awaitCompletion
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-fatal-waiter-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* startLiveSynchronization({
+        sourcePath, outputPath,
+        declare: () => Effect.succeed({ work: ["document"], publish: Effect.void }),
+        handle: (_path: string) => Effect.succeed([]),
+      });
+      const completion = yield* Effect.exit(session.awaitCompletion);
+      // #when the waiter asks for another pass immediately after completion failure
+      const admission = yield* session.requestPass();
+      const status = yield* session.status;
+      return { completionFailed: Exit.isFailure(completion), admission, state: status.state };
+    })));
+    // #then no unreachable pass is admitted
+    expect(result).toEqual({ completionFailed: true, admission: "rejected", state: "stopped" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("adding a child file does not invalidate unchanged sibling files through the parent directory", async () => {
+  // #given retained sibling files under the same directory
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-directory-add-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(join(sourcePath, "book"), { recursive: true });
+  await Bun.write(join(sourcePath, "book", "one.txt"), "One");
+  await Bun.write(join(sourcePath, "book", "two.txt"), "Two");
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const handled: string[] = [];
+      const session = yield* openLiveSynchronization({
+        sourcePath, outputPath,
+        freshness: { describe: (path: string) => ({ sourcePaths: [path], resultKind: "file", processingVersion: "v1", outputPaths: [path] }) },
+        declare: (entries) => Effect.succeed({ work: entries.filter((entry) => entry.kind === "file").map((entry) => entry.path), publish: Effect.void }),
+        handle: (path: string) => io(async () => {
+          handled.push(path);
+          await mkdir(join(outputPath, "book"), { recursive: true });
+          await Bun.write(join(outputPath, path), await readFile(join(sourcePath, path), "utf8"));
+          return [];
+        }),
+      });
+      handled.length = 0;
+      // #when one child is added and the parent directory mtime changes
+      yield* io(() => Bun.write(join(sourcePath, "book", "three.txt"), "Three"));
+      yield* session.requestPass();
+      yield* session.awaitCompletion;
+      return handled;
+    })));
+    // #then only the new file needs processing
+    expect(result).toEqual(["book/three.txt"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("directory removal and kind changes keep prefix invalidation", async () => {
+  // #given retained records under a directory and at a path that will change kind
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-directory-kind-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const stamp = new Date("2020-01-01T00:00:00Z");
+  await mkdir(join(sourcePath, "gone"), { recursive: true });
+  await Bun.write(join(sourcePath, "gone", "one.txt"), "Gone one");
+  await Bun.write(join(sourcePath, "flip"), "File first");
+  await utimes(join(sourcePath, "gone", "one.txt"), stamp, stamp);
+  await utimes(join(sourcePath, "flip"), stamp, stamp);
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const handled: string[] = [];
+      const session = yield* openLiveSynchronization({
+        sourcePath, outputPath,
+        freshness: { describe: (path: string) => ({ sourcePaths: [path], resultKind: "file", processingVersion: "v1", outputPaths: [`out-${path.replaceAll("/", "__")}`] }) },
+        declare: (entries) => Effect.succeed({ work: entries.filter((entry) => entry.kind === "file").map((entry) => entry.path), publish: Effect.void }),
+        handle: (path: string) => io(async () => {
+          handled.push(path);
+          await Bun.write(join(outputPath, `out-${path.replaceAll("/", "__")}`), await readFile(join(sourcePath, path), "utf8"));
+          return [];
+        }),
+      });
+
+      handled.length = 0;
+      // #when a directory is removed, then recreated with equal child metadata
+      yield* io(() => rm(join(sourcePath, "gone"), { recursive: true }));
+      yield* session.requestPass();
+      yield* session.awaitCompletion;
+      yield* io(() => mkdir(join(sourcePath, "gone")));
+      yield* io(() => Bun.write(join(sourcePath, "gone", "one.txt"), "Gone one"));
+      yield* io(() => utimes(join(sourcePath, "gone", "one.txt"), stamp, stamp));
+      yield* session.requestPass();
+      yield* session.awaitCompletion;
+      const afterRemoval = [...handled];
+
+      handled.length = 0;
+      // #and a file path changes to a directory and back to the same file metadata
+      const old = yield* io(() => stat(join(sourcePath, "flip")));
+      yield* io(() => rm(join(sourcePath, "flip")));
+      yield* io(() => mkdir(join(sourcePath, "flip")));
+      yield* io(() => Bun.write(join(sourcePath, "flip", "child.txt"), "Child"));
+      yield* session.requestPass();
+      yield* session.awaitCompletion;
+      yield* io(() => rm(join(sourcePath, "flip"), { recursive: true }));
+      yield* io(() => Bun.write(join(sourcePath, "flip"), "File first"));
+      yield* io(() => utimes(join(sourcePath, "flip"), old.atime, old.mtime));
+      yield* session.requestPass();
+      yield* session.awaitCompletion;
+      return { afterRemoval, afterKindChange: [...handled] };
+    })));
+    // #then removed directories and kind changes drop the old retained records
+    expect(result).toEqual({ afterRemoval: ["gone/one.txt"], afterKindChange: ["flip/child.txt", "flip"] });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

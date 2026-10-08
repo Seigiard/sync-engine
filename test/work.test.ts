@@ -231,6 +231,25 @@ test("non-finite concurrency falls back to one worker", async () => {
   expect(result).toEqual({ completion: "completed", handled: ["refresh"], state: "complete" });
 });
 
+test("undefined is a valid work item rather than an empty-queue sentinel", async () => {
+  // #given a payload-free public work scheduler
+  const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    let handled = 0;
+    const scheduler = yield* createWorkScheduler<void, never, never>({
+      handle: (work) => Effect.sync(() => {
+        if (work === undefined) handled += 1;
+        return [] as void[];
+      }),
+    });
+    // #when undefined is submitted as the work value
+    yield* scheduler.submit([undefined]);
+    yield* scheduler.awaitCompletion;
+    return { handled, state: (yield* scheduler.status).state };
+  })));
+  // #then the handler sees the item exactly once
+  expect(result).toEqual({ handled: 1, state: "complete" });
+});
+
 test("pending work with an active equivalent key waits while different-key work starts", async () => {
   // #given a held active publication, an equivalent follow-up and an independent publication
   const root = await mkdtemp(join(tmpdir(), "sync-engine-keyed-concurrent-"));

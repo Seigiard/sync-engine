@@ -24,6 +24,8 @@ Without that policy, regular source names are unrestricted.
 `openSynchronization(options)` runs the same initial pass and returns a scoped
 `Synchronization`, compatible with `WorkScheduler`. Keep it inside `Effect.scoped`; its output lease remains held
 until the scope closes. `submit(work)` accepts subsequent application work.
+After that scope closes, the returned handle rejects admission and completion
+without touching retained freshness.
 `awaitCompletion` waits for pending, active and handler-returned required work.
 `status` reports `working`, `complete`, `complete-with-errors`, `failed` or
 `stopped`, with pending count, one active work item and `errors: [{ work, cause }]`.
@@ -184,6 +186,10 @@ minimum gate described above. Later declarations repair in place. The source tre
 Live passes forward `force` and `changedPaths` to freshness-aware admission.
 Declare every applicable result on every pass so processing-version or content
 checks can select rebuilding even when size and mtime do not change.
+Detected directory mtime changes do not become subtree freshness hints while the
+directory still exists as a directory; its changed children are reported instead.
+Removed directories and file/directory kind changes still invalidate by prefix.
+Explicit watcher hints passed to `notify` keep their prefix semantics.
 
 The returned session exposes:
 

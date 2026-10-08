@@ -122,6 +122,8 @@ export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>): Eff
     const plan = yield* options.declare(entries);
     const freshness = yield* openFreshness(options, statePath);
     const scheduler = yield* createWorkScheduler({ ...options, handle: freshness.handle });
+    let closed = false;
+    yield* Effect.addFinalizer(() => Effect.sync(() => { closed = true; }));
     if (plan.minimum !== undefined && plan.minimum.length > 0) {
       yield* scheduler.submit(plan.minimum);
       yield* scheduler.awaitCompletion;
@@ -137,8 +139,8 @@ export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>): Eff
     yield* freshness.commit;
     return {
       ...scheduler,
-      submit: (work: readonly W[], input?: WorkInput) => (input === undefined ? freshness.invalidateWork(work) : freshness.invalidate(input)).pipe(Effect.andThen(scheduler.submit(work))),
-      awaitCompletion: scheduler.awaitCompletion.pipe(Effect.andThen(freshness.commit)),
+      submit: (work: readonly W[], input?: WorkInput) => Effect.suspend(() => closed ? Effect.interrupt : (input === undefined ? freshness.invalidateWork(work) : freshness.invalidate(input)).pipe(Effect.andThen(scheduler.submit(work)))),
+      awaitCompletion: Effect.suspend(() => closed ? Effect.interrupt : scheduler.awaitCompletion.pipe(Effect.andThen(Effect.suspend(() => closed ? Effect.interrupt : freshness.commit)))),
     };
   });
 }
