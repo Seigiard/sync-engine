@@ -1,0 +1,7 @@
+services:
+  engine-test:
+    build: .
+    volumes:
+      - ./src:/app/src:ro
+      - ./test:/app/test:ro
+      - ./tsconfig.json:/app/tsconfig.json:ro
