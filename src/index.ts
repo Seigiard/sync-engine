@@ -18,6 +18,12 @@ export interface SourceEntry {
 }
 
 export interface InitialPlan<W, E, R> {
+  /**
+   * Application-defined minimum: runs first and fails the open at once when it cannot finish.
+   * It is not repeated by later passes; list work that must also run again in `work`.
+   */
+  readonly minimum?: readonly W[];
+  /** The remaining required work. It gates completion, not the minimum. */
   readonly work: readonly W[];
   /** Runs after all initial work and its required cascades succeed. */
   readonly publish: Effect.Effect<void, E, R>;
@@ -30,6 +36,8 @@ export interface InitialPass<W, E, R> extends WorkOptions<W, E, R> {
   /** Application-owned source policy. Excluded paths are skipped before filesystem traversal. */
   readonly includeSource?: (relativePath: string) => boolean;
   readonly declare: (entries: readonly SourceEntry[]) => Effect.Effect<InitialPlan<W, E, R>, E, R>;
+  /** Runs once, after the declared minimum finished without errors and before the remaining work starts. */
+  readonly onMinimum?: Effect.Effect<void, E, R>;
   readonly freshness?: FreshnessOptions<W>;
 }
 
@@ -114,6 +122,13 @@ export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>): Eff
     const plan = yield* options.declare(entries);
     const freshness = yield* openFreshness(options, statePath);
     const scheduler = yield* createWorkScheduler({ ...options, handle: freshness.handle });
+    if (plan.minimum !== undefined && plan.minimum.length > 0) {
+      yield* scheduler.submit(plan.minimum);
+      yield* scheduler.awaitCompletion;
+      const prepared = yield* scheduler.status;
+      if (prepared.errors.length > 0) return yield* Effect.failCause(prepared.errors[0]!.cause);
+    }
+    if (options.onMinimum) yield* options.onMinimum;
     yield* scheduler.submit(plan.work);
     yield* scheduler.awaitCompletion;
     const completed = yield* scheduler.status;

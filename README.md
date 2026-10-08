@@ -84,8 +84,19 @@ cascades after removal. No object identity persists across source moves.
 The exact `effect@4.0.1` peer keeps one runtime identity. The tarball ships
 TypeScript source for Bun; it contains neither node_modules nor bundled Effect.
 This local release is not an npm publication. Applications own watcher transport;
-the live API owns resync scheduling and reconciliation. Optional-work readiness
-and concurrency are later slices.
+the live API owns resync scheduling and reconciliation. Concurrency is a later slice.
+
+## Minimum readiness
+
+An `InitialPlan` may declare `minimum` work beside `work`. The initial pass runs
+the minimum first. A minimum that cannot finish fails the open at once, before
+the remaining work starts. When it drains without errors the engine runs the
+optional `onMinimum` Effect, then submits `work`. The application decides what
+the minimum is and what "ready" means; the engine reports only that the minimum
+finished. Completion still waits for all required work. A plan without `minimum`
+runs `onMinimum` right after declaration. Later live passes ignore `minimum`;
+list work that must repeat in `work` as well. `LiveStatus.failure` carries the
+cause of the last failed pass until a later pass succeeds.
 
 ## Freshness
 

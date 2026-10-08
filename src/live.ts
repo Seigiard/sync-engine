@@ -21,6 +21,8 @@ export interface LiveStatus<W> {
   readonly state: WorkStatus<W>["state"];
   readonly pass: PassRequest | null;
   readonly followUp: PassRequest | null;
+  /** Cause of the last failed pass; a later successful pass clears it. */
+  readonly failure: Cause.Cause<unknown> | null;
   readonly work: WorkStatus<W>;
 }
 
@@ -138,7 +140,7 @@ export function openLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>):
       awaitCompletion: Effect.suspend(() => Deferred.await(completion)),
       status: Effect.gen(function* () {
         const work = yield* scheduler.status;
-        return { state, pass: active, followUp: pending, work };
+        return { state, pass: active, followUp: pending, failure, work };
       }),
     };
   });

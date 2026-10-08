@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Effect } from "effect";
+import { Cause, Effect } from "effect";
 import { openLiveSynchronization } from "../src/index.ts";
 
 const io = <A>(run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: (cause) => new Error(String(cause)) }).pipe(Effect.uninterruptible);
@@ -158,6 +158,40 @@ test("combined requests during processing preserve a forced repair of unchanged 
     expect(result).toEqual({ before: "First original", admissions: ["queued", "queued", "queued"], first: "First current replacement", second: "Second unchanged" });
   } finally {
     release.open();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed pass exposes its failure while earlier output stays available", async () => {
+  // #given a completed real session whose source root is then removed
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-pass-failure-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "document"), "Original publication");
+
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* openLiveSynchronization({
+        sourcePath, outputPath,
+        declare: () => Effect.succeed({ work: ["document"], publish: Effect.void }),
+        handle: (path: string) => io(async () => {
+          await Bun.write(join(outputPath, "reference"), await readFile(join(sourcePath, path), "utf8"));
+          return [];
+        }),
+      });
+      yield* session.awaitCompletion;
+      yield* io(() => rm(sourcePath, { recursive: true, force: true }));
+      // #when the next pass cannot read the source
+      yield* session.requestPass();
+      const outcome = yield* session.awaitCompletion.pipe(Effect.as("success"), Effect.catchTag("ScanFailed", () => Effect.succeed("scan failed")));
+      const status = yield* session.status;
+
+      return { outcome, state: status.state, failure: status.failure ? Cause.pretty(status.failure).includes(sourcePath) : null, reference: yield* io(() => readFile(join(outputPath, "reference"), "utf8")) };
+    })));
+    // #then the failure is a public fact and the earlier publication is intact
+    expect(result).toEqual({ outcome: "scan failed", state: "failed", failure: true, reference: "Original publication" });
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
