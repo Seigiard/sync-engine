@@ -77,3 +77,30 @@ bun pm pack
 OPDS's `docs/agents/shared-sync-engine.md` records the integration reproduction
 command and temporary lifecycle selection seam. Copy a versioned packed
 artifact to that consumer; direct checkout imports are not the release boundary.
+# Live synchronization
+
+`openLiveSynchronization(options)` retains the scoped output lease and performs
+the initial publication. It adds engine-owned source scans, pass scheduling and
+periodic reconciliation to `openSynchronization`.
+
+The application supplies `declare(entries, request)` and the existing handler,
+key and publication contracts. `request` contains `kind`, `force` and relative
+`changedPaths`. Initial declaration prepares the initial publication. Later
+declarations repair in place. The source tree remains authoritative.
+
+The returned session exposes:
+
+- `notify(relativePaths)`: retain watcher hints and schedule reconsideration.
+- `requestPass({force})`: start a pass or combine into the pending follow-up.
+- `awaitCompletion`: await admitted scans, processing, publication and follow-ups.
+- `status`: observe the active pass, pending request and work completion separately.
+
+A pass remains active until required work and final publication finish. Requests
+during that interval guarantee a follow-up. Pending requests combine, retaining
+every dirty path and any forced mode. A post-processing traversal detects source
+size, mtime, kind and membership changes and requests repair before completion.
+This includes the initial pass. Stable detectable sources converge after successful
+processing; traversal does not provide a filesystem snapshot.
+
+`reconcileIntervalMs` enables the scoped timer; zero disables it. Scope closure
+stops the timer and pass consumer before the work scheduler releases its lease.

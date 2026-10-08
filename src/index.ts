@@ -1,6 +1,7 @@
 import { Data, Effect, type Scope } from "effect";
 import { createWorkScheduler, type WorkOptions, type WorkScheduler } from "./work.ts";
 export { createWorkScheduler, type WorkOptions, type WorkScheduler, type WorkStatus } from "./work.ts";
+export { openLiveSynchronization, type LiveOptions, type LiveSynchronization, type PassRequest, type PassAdmission, type LiveStatus } from "./live.ts";
 import { lstat, mkdir, readdir, realpath } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
@@ -20,6 +21,7 @@ export interface InitialPlan<W, E, R> {
 export interface InitialPass<W, E, R> extends WorkOptions<W, E, R> {
   readonly sourcePath: string;
   readonly outputPath: string;
+  readonly includeSource?: (relativePath: string) => boolean;
   readonly declare: (entries: readonly SourceEntry[]) => Effect.Effect<InitialPlan<W, E, R>, E, R>;
 }
 
@@ -75,7 +77,7 @@ export function acquireOutputTree(outputPath: string): Effect.Effect<() => Promi
   }).pipe(Effect.uninterruptible);
 }
 
-function scanSource(sourcePath: string): Effect.Effect<readonly SourceEntry[], ScanFailed> {
+export function scanSource(sourcePath: string, includeSource?: (relativePath: string) => boolean): Effect.Effect<readonly SourceEntry[], ScanFailed> {
   const read = <A>(path: string, run: () => Promise<A>) => Effect.tryPromise({
     try: run,
     catch: (cause) => new ScanFailed({ path, cause }),
@@ -96,6 +98,7 @@ function scanSource(sourcePath: string): Effect.Effect<readonly SourceEntry[], S
 
       for (const name of names) {
         const path = join(folder, name);
+        if (includeSource && !includeSource(path)) continue;
         const absolutePath = join(sourcePath, path);
         const info = yield* read(absolutePath, () => lstat(absolutePath));
 
@@ -153,7 +156,7 @@ export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>): Eff
     }).pipe(Effect.uninterruptible);
 
     yield* Effect.acquireRelease(acquireOutputTree(options.outputPath), (release) => Effect.promise(release));
-    const entries = yield* scanSource(options.sourcePath);
+    const entries = yield* scanSource(options.sourcePath, options.includeSource);
     const plan = yield* options.declare(entries);
     const scheduler = yield* createWorkScheduler(options);
     yield* scheduler.submit(plan.work);
