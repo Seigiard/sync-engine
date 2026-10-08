@@ -1,21 +1,36 @@
 {
   "name": "@seigiard/sync-engine",
-  "version": "0.3.1",
+  "description": "Shared Effect 4 synchronization engine: source scans, required work, freshness, live passes and output ownership.",
+  "version": "0.4.0",
   "type": "module",
-  "exports": { ".": "./src/index.ts" },
-  "files": ["src", "README.md"],
-  "repository": { "type": "git", "url": "https://github.com/Seigiard/sync-engine.git" },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Seigiard/sync-engine.git"
+  },
   "scripts": {
     "check": "bun run lint && bun run typecheck && bun test",
-    "lint": "oxlint --deny-warnings src test",
+    "lint": "oxlint --deny-warnings src test scripts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "verify:pack": "bun scripts/verify-pack.ts"
   },
-  "peerDependencies": { "effect": "4.0.1" },
+  "peerDependencies": {
+    "effect": "4.0.1"
+  },
   "devDependencies": {
     "effect": "4.0.1",
     "@types/bun": "1.3.14",
     "typescript": "5.9.3",
     "oxlint": "1.87.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

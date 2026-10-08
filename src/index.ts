@@ -4,7 +4,7 @@ export { acquireOutputTree, engineStatePath, OutputOwnershipFailed } from "./own
 import { createWorkScheduler, type WorkOptions, type WorkScheduler } from "./work.ts";
 export { observeSourcePath, readSourceDirectory, removeAssociatedOutputs, nativeSourceFileSystem, SourceObservationFailed, OutputCleanupFailed, type SourceFileSystem, type SourceObservation, type AssociatedOutputs } from "./source.ts";
 export { createWorkScheduler, type WorkOptions, type WorkScheduler, type WorkStatus, type WorkFailure } from "./work.ts";
-export { openLiveSynchronization, type LiveOptions, type LiveSynchronization, type PassRequest, type PassAdmission, type LiveStatus } from "./live.ts";
+export { openLiveSynchronization, startLiveSynchronization, type LiveOptions, type LiveSynchronization, type LiveHandle, type PassRequest, type PassAdmission, type LiveStatus, type Availability } from "./live.ts";
 import { lstat, readdir, realpath } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import { openFreshness, type FreshnessOptions, type FreshnessFailed, type WorkInput } from "./freshness.ts";

@@ -8,7 +8,7 @@ Repository identity: `Seigiard/sync-engine`.
 The library owns synchronization mechanisms. Applications own domain processing and publication requirements.
 Bun on Linux/Docker and Effect 4 are the supported execution boundary.
 
-## Local package: 0.3.1
+## Initial pass and scheduler
 
 `runInitialPass({ sourcePath, outputPath, declare, handle })` returns an Effect.
 It scans regular source paths and directories, with relative path identity,
@@ -83,7 +83,7 @@ cascades after removal. No object identity persists across source moves.
 
 The exact `effect@4.0.1` peer keeps one runtime identity. The tarball ships
 TypeScript source for Bun; it contains neither node_modules nor bundled Effect.
-This local release is not an npm publication. Applications own watcher transport;
+Applications own watcher transport;
 the live API owns resync scheduling and reconciliation. Concurrency is a later slice.
 
 ## Minimum readiness
@@ -141,18 +141,31 @@ compatible with existing retained records.
 - OPML: required RSS cascades precede final OPML. Its private cache projection
   remains application logic.
 
-## Verify and pack
+## Verify, pack and release
+
+The package ships TypeScript source (`src`, `README.md`, `package.json`) for Bun on Linux. `effect@4.0.1` is an exact
+peer. `publishConfig.access` is `public` for the scoped name.
 
 ```sh
-COMPOSE_PROJECT_NAME=opds49-52 docker compose -f docker-compose.test.yml run --build --rm engine-test
-COMPOSE_PROJECT_NAME=opds49-52 bun test/shared-mount-check.ts
-COMPOSE_PROJECT_NAME=opds49-52 docker compose -f docker-compose.test.yml down
-bun pm pack
+# 1. Lint, typecheck and tests in Linux/Docker (flock needs util-linux)
+COMPOSE_PROJECT_NAME=sync-engine docker compose -f docker-compose.test.yml run --build --rm engine-test
+COMPOSE_PROJECT_NAME=sync-engine bun test/shared-mount-check.ts
+COMPOSE_PROJECT_NAME=sync-engine docker compose -f docker-compose.test.yml down
+# 2. From a clean checkout: pack and verify identity, peer, exact inventory and byte equality
+bun scripts/verify-pack.ts <destination>
 ```
 
-OPDS's `docs/agents/shared-sync-engine.md` records the integration reproduction
-command and temporary lifecycle selection seam. Copy a versioned packed
-artifact to that consumer; direct checkout imports are not the release boundary.
+`verify-pack.ts` fails on a dirty tree, a version or peer mismatch, an unexpected file, or any packed
+file that differs from the checkout. It prints the commit, archive path, size, SHA256 and the SHA512
+integrity string a lockfile records. A release is the `npm publish` of that archive's checkout; verify
+the registry afterwards with `npm view @seigiard/sync-engine@<version> dist.integrity` and compare it to
+the printed integrity.
+
+Update a consumer in two steps. Development: copy the archive to the consumer's `vendor/` under a
+content-qualified name, depend on `file:vendor/<name>` and rebuild its images; Bun caches file
+dependencies by path, so reuse of a basename keeps the old copy. Release: replace that dependency
+with the exact registry version, regenerate the lock, and rebuild. Never ship a consumer whose
+runtime dependency is a local archive or checkout.
 
 ## Live synchronization
 
@@ -184,6 +197,24 @@ processing; traversal does not provide a filesystem snapshot.
 
 `reconcileIntervalMs` enables the scoped timer; zero disables it. Scope closure
 stops the timer and pass consumer before the work scheduler releases its lease.
+
+## First-pass failure map and retry
+
+`startLiveSynchronization(options)` returns a `LiveHandle` at once and runs the first pass in the
+background. `openLiveSynchronization` is `start` plus `ready`. `ready` settles when the first pass
+did. Requests made before that (`requestPass`, `notify`) report `queued`, combine, and run as one
+follow-up pass after the open, keeping force and every hint.
+
+Without `recovery` a failed first pass fails `ready`. With
+`recovery: { existing }` the engine tolerates it while output is usable: `existing` reports earlier
+output that already serves (read once before the first pass), and a published `minimum` counts
+too. `status.availability` reports `"prior-output"`, `"minimum-publication"` or `null`. A tolerated
+failure resolves `ready`, sets `status.failure` and `state: "failed"`, releases the lease and waits.
+The next `requestPass`/`notify` (reports `started`) or reconcile tick reopens the session in the
+same scope: a full first pass again, then any retained request. A disabled timer
+(`reconcileIntervalMs: 0`) leaves only requests as retry triggers. Without usable output `ready` fails
+and the application decides whether that is fatal. This is the one owner of retry and reconcile
+scheduling; applications keep no timer of their own.
 
 ## Cooperative shutdown and restart
 

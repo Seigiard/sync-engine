@@ -58,7 +58,7 @@ test("scope shutdown closes pass admission before awaiting a started publication
     // #then admission was closed immediately and startup repaired the actual artifact
     expect({ during, stopped: await Effect.runPromise(session.status), interrupted: Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause), published: await readFile(join(outputPath, "published"), "utf8") }).toEqual({
       during: { admission: "rejected", notification: "rejected", state: "stopped", finished: false },
-      stopped: { state: "stopped", pass: null, followUp: null, failure: null, work: { state: "stopped", pending: 0, active: null, errors: [] } },
+      stopped: { state: "stopped", pass: null, followUp: null, failure: null, availability: null, work: { state: "stopped", pending: 0, active: null, errors: [] } },
       interrupted: true, published: "Current document",
     });
   } finally {

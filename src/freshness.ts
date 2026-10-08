@@ -83,7 +83,14 @@ export function openFreshness<W, E, R>(
       const sources = [];
       for (const source of descriptor.sourcePaths) {
         const absolute = checkedPath(options.sourcePath, source);
-        const info = await lstat(absolute);
+        let info;
+        try { info = await lstat(absolute); }
+        catch (cause) {
+          // A vanished source is a stamp of its own, never equal to a recorded one. Whether it is really gone is the
+          // handler's to confirm; failing here would turn one removal into a failed pass.
+          if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") { sources.push([source, null, null, null]); continue; }
+          throw cause;
+        }
         if (!info.isFile() && !info.isDirectory()) throw new Error(`Unsupported freshness source: ${source}`);
         const digest = options.freshness?.check === "content" && info.isFile()
           ? createHash("sha256").update(await readFile(absolute)).digest("hex") : null;

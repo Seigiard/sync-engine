@@ -4,4 +4,5 @@ services:
     volumes:
       - ./src:/app/src:ro
       - ./test:/app/test:ro
+      - ./scripts:/app/scripts:ro
       - ./tsconfig.json:/app/tsconfig.json:ro

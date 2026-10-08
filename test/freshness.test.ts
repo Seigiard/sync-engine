@@ -237,3 +237,22 @@ test("a hint during active equal-stamp work prevents an earlier read from becomi
     expect(await readFile(join(outputPath, "note"), "utf8")).toBe("Published: Replaced source");
   } finally { release(); await rm(root, { recursive: true, force: true }); }
 });
+
+test("work whose declared source disappeared reaches its handler instead of failing freshness", async () => {
+  // #given a result recorded for a source that is then removed, with its output still present
+  const { root, sourcePath, outputPath, options } = await textTree();
+  const handled: string[] = [];
+  try {
+    await Effect.runPromise(runInitialPass(options()));
+    await rm(join(sourcePath, "note.txt"));
+    // #when a fresh instance declares the same work for the vanished source
+    const outcome = await Effect.runPromise(runInitialPass({
+      ...options(),
+      handle: (work: string) => io(async () => { handled.push(work); await rm(join(outputPath, "note")); return [] as string[]; }),
+    }).pipe(Effect.as("completed"), Effect.catchTag("FreshnessFailed", () => Effect.succeed("freshness failed"))));
+    // #then absence is the handler's to confirm: it ran, and the pass did not fail on the missing stamp
+    expect({ outcome, handled, output: await Bun.file(join(outputPath, "note")).exists() }).toEqual({ outcome: "completed", handled: ["note"], output: false });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
