@@ -34,11 +34,12 @@ A successful retry clears that identity; repeated failures replace its record.
 
 Applications can supply `key(work)` for refresh requests. A defined key combines
 equivalent pending work and moves it behind intervening work. An active request
-is separate: another request schedules one pending follow-up. Undefined keys
-retain each request. Results publish as handlers finish; the scheduler neither
+is separate: another request schedules one pending follow-up. With `concurrency`
+above one, keyed pending work waits while an equivalent key is active. Undefined keys
+retain each request and can run in parallel. Results publish as handlers finish; the scheduler neither
 stages a whole-tree snapshot nor observes output writes.
 
-`createWorkScheduler({ handle, key })` exposes the same scoped work mechanism
+`createWorkScheduler({ handle, key, concurrency })` exposes the same scoped work mechanism
 without scanning or acquiring an output lease. Use `openSynchronization` for
 an application output tree. Defects and interruption stop this scheduler;
 typed handler failures are recoverable work results. Scope close joins the owned consumer fiber
@@ -84,7 +85,7 @@ cascades after removal. No object identity persists across source moves.
 The exact `effect@4.0.1` peer keeps one runtime identity. The tarball ships
 TypeScript source for Bun; it contains neither node_modules nor bundled Effect.
 Applications own watcher transport;
-the live API owns resync scheduling and reconciliation. Concurrency is a later slice.
+the live API owns resync scheduling and reconciliation. `concurrency` defaults to one.
 
 ## Minimum readiness
 
@@ -137,7 +138,7 @@ compatible with existing retained records.
 
 - OPDS: required book/folder cascades precede root publication.
 - TTRPG: a full listing admits tree classification and index work; optional
-  parallel images need a later scheduling/readiness extension.
+  images can run as parallel engine work when keyed republish work is used.
 - OPML: required RSS cascades precede final OPML. Its private cache projection
   remains application logic.
 

@@ -115,6 +115,66 @@ test("independent work can run concurrently without reporting completion early",
   }
 });
 
+test("pending work with an active equivalent key waits while different-key work starts", async () => {
+  // #given a held active publication, an equivalent follow-up and an independent publication
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-keyed-concurrent-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  try {
+    // #when the scheduler has more than one permit
+    const observation = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const firstEntered = yield* Deferred.make<void>();
+      const sameEntered = yield* Deferred.make<void>();
+      const otherEntered = yield* Deferred.make<void>();
+      const releaseFirst = yield* Deferred.make<void>();
+      const releaseSame = yield* Deferred.make<void>();
+      const started: string[] = [];
+      const scheduler = yield* openSynchronization({
+        sourcePath,
+        outputPath,
+        concurrency: 2,
+        key: (work: string) => work.startsWith("same:") ? "same" : work,
+        declare: () => Effect.succeed({ work: [], publish: Effect.void }),
+        handle: (work: string) => Effect.gen(function* () {
+          started.push(work);
+          if (work === "same:first") {
+            yield* Deferred.succeed(firstEntered, undefined);
+            yield* Deferred.await(releaseFirst);
+          } else if (work === "same:second") {
+            yield* Deferred.succeed(sameEntered, undefined);
+            yield* Deferred.await(releaseSame);
+          } else {
+            yield* Deferred.succeed(otherEntered, undefined);
+          }
+          yield* io(() => Bun.write(join(outputPath, work.replace(":", "-")), started.join(",")));
+          return [];
+        }),
+      });
+      yield* scheduler.submit(["same:first"]);
+      yield* Deferred.await(firstEntered);
+      yield* scheduler.submit(["same:second", "other"]);
+      yield* Deferred.await(otherEntered);
+      const beforeRelease = [...started];
+      yield* Deferred.succeed(releaseFirst, undefined);
+      yield* Deferred.await(sameEntered);
+      const afterRelease = [...started];
+      yield* Deferred.succeed(releaseSame, undefined);
+      yield* scheduler.awaitCompletion;
+      return { beforeRelease, afterRelease, final: yield* io(() => readFile(join(outputPath, "same-second"), "utf8")) };
+    })));
+
+    // #then the equivalent follow-up starts only after the active same-key work finishes
+    expect(observation).toEqual({
+      beforeRelease: ["same:first", "other"],
+      afterRelease: ["same:first", "other", "same:second"],
+      final: "same:first,other,same:second",
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("an equivalent refresh requested while active publishes the later source", async () => {
   // #given a real mutable source and a held refresh that already read its earlier bytes
   const root = await mkdtemp(join(tmpdir(), "sync-engine-active-"));
