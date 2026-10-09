@@ -927,6 +927,148 @@ test("reconcile ticks do not keep completion outstanding while a one-shot retry 
   }
 });
 
+type PayloadScenario =
+  | "opening-ok"
+  | "opening-fail-retry-ok"
+  | "opening-fail-retry-fail-reopen-ok"
+  | "retry-ok"
+  | "retry-fail-reopen-ok"
+  | "reopen-ok"
+  | "reopen-fail-later-ok"
+  | "running-recoverable-defect";
+
+async function runPayloadScenario(scenario: PayloadScenario) {
+  const root = await mkdtemp(join(tmpdir(), `sync-engine-payload-model-${scenario}-`));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  await mkdir(outputPath);
+  await Bun.write(join(sourcePath, "note.txt"), "Current");
+  const followUps: PassSnapshot[] = [];
+  const entered = gate();
+  const release = gate();
+  const retryEntered = gate();
+  const releaseRetry = gate();
+  let attempts = 0;
+  const shouldFail = (attempt: number) => {
+    if (scenario === "opening-fail-retry-ok") return attempt === 1;
+    if (scenario === "opening-fail-retry-fail-reopen-ok") return attempt === 1 || attempt === 2;
+    if (scenario === "retry-fail-reopen-ok") return attempt === 1 || attempt === 2;
+    if (scenario === "reopen-fail-later-ok") return attempt === 1 || attempt === 2;
+    return false;
+  };
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* startLiveSynchronization({
+        sourcePath,
+        outputPath,
+        reconcileIntervalMs: 0,
+        recovery: { existing: Effect.succeed(true) },
+        declare: (_entries, request) => Effect.sync(() => {
+          if (request.kind !== "initial") followUps.push({ kind: request.kind, force: request.force, changedPaths: [...request.changedPaths] });
+          return { work: ["note.txt"], publish: Effect.void };
+        }),
+        handle: (path: string) => {
+          const effect = io(async () => {
+            attempts += 1;
+            const attempt = attempts;
+            if (scenario === "opening-fail-retry-fail-reopen-ok" && attempt === 1) { entered.open(); await release.promise; }
+            if (scenario === "opening-fail-retry-fail-reopen-ok" && attempt === 2) { retryEntered.open(); await releaseRetry.promise; }
+            const held = scenario !== "opening-fail-retry-fail-reopen-ok" && (scenario === "opening-ok" && attempt === 1
+              || scenario === "opening-fail-retry-ok" && attempt === 1
+              || scenario === "retry-ok" && attempt === 2
+              || scenario === "retry-fail-reopen-ok" && attempt === 2
+              || scenario === "reopen-ok" && attempt === 2
+              || scenario === "reopen-fail-later-ok" && attempt === 2
+              || scenario === "running-recoverable-defect" && attempt === 2);
+            if (held) { entered.open(); await release.promise; }
+            if (scenario === "running-recoverable-defect" && attempt === 2) throw new Error("recoverable running defect");
+            if (shouldFail(attempt)) throw new Error("recoverable opening failure");
+            await Bun.write(join(outputPath, path), await readFile(join(sourcePath, path), "utf8"));
+            return [] as string[];
+          });
+          return scenario === "running-recoverable-defect" ? effect.pipe(Effect.orDie) : effect;
+        },
+      });
+
+      if (scenario === "opening-ok" || scenario === "opening-fail-retry-ok") {
+        yield* io(() => entered.promise);
+        yield* session.requestPass({ force: true });
+        yield* session.notify(["note.txt"]);
+        release.open();
+      } else if (scenario === "opening-fail-retry-fail-reopen-ok") {
+        yield* io(() => entered.promise);
+        yield* session.requestPass({ force: true });
+        yield* session.notify(["note.txt"]);
+        release.open();
+        yield* io(() => retryEntered.promise);
+        yield* session.requestPass();
+        releaseRetry.open();
+      } else if (scenario === "retry-ok" || scenario === "retry-fail-reopen-ok") {
+        yield* session.requestPass();
+        yield* io(() => entered.promise);
+        yield* session.requestPass({ force: true });
+        yield* session.notify(["note.txt"]);
+        release.open();
+      } else if (scenario === "reopen-ok" || scenario === "reopen-fail-later-ok") {
+        yield* Effect.exit(session.awaitCompletion);
+        yield* session.requestPass({ force: true });
+        yield* session.notify(["note.txt"]);
+        yield* io(() => entered.promise);
+        release.open();
+        if (scenario === "reopen-fail-later-ok") yield* Effect.exit(session.awaitCompletion).pipe(Effect.andThen(session.requestPass()));
+      } else {
+        yield* session.awaitCompletion;
+        yield* session.requestPass();
+        yield* io(() => entered.promise);
+        yield* session.requestPass({ force: true });
+        yield* session.notify(["note.txt"]);
+        release.open();
+      }
+
+      yield* session.awaitCompletion;
+      return { attempts, followUps };
+    })));
+    const payloadBearing = result.followUps.filter((request) => request.force || request.changedPaths.length > 0);
+    const matching = payloadBearing.filter((request) => request.force && request.changedPaths.length === 1 && request.changedPaths[0] === "note.txt");
+    return { attempts: result.attempts, followUps: result.followUps, payloadBearing, matching };
+  } finally {
+    release.open();
+    releaseRetry.open();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test.each([
+  ["during first opening -> open ok", "opening-ok"],
+  ["during first opening -> open fail -> retry ok", "opening-fail-retry-ok"],
+  ["during first opening -> open fail -> retry fail -> reopen ok", "opening-fail-retry-fail-reopen-ok"],
+  ["during one-shot retry -> retry ok", "retry-ok"],
+  ["during one-shot retry -> retry fail -> reopen ok", "retry-fail-reopen-ok"],
+  ["during reopen -> open ok", "reopen-ok"],
+  ["during reopen -> open fail -> later open ok", "reopen-fail-later-ok"],
+  ["while running -> recoverable defect -> retry ok", "running-recoverable-defect"],
+] as const)("request payload model preserves force and hints exactly once: %s", async (_label, scenario) => {
+  // #given a table cell that admits a forced request and a source hint at a distinct live state
+  const result = await runPayloadScenario(scenario);
+  // #then the next successful follow-up declare receives their union exactly once
+  expect({ matching: result.matching, payloadBearing: result.payloadBearing }).toEqual({
+    matching: [{ kind: "resync", force: true, changedPaths: ["note.txt"] }],
+    payloadBearing: [{ kind: "resync", force: true, changedPaths: ["note.txt"] }],
+  });
+});
+
+test("request payload model records cells that cannot be driven deterministically", () => {
+  // #given the remaining requested interleaving requires a seam after the work scheduler finalizer closed
+  const uncalibrated = [{
+    admission: "scope-closing window of a recoverable running failure",
+    ending: "retry fail or retry ok after the request is accepted",
+    reason: "No internal hook currently runs after the live attempt's scheduler finalizer has closed and before supervise clears scheduler/machine; issuing a public request from a handler finalizer hung before a stable admission result.",
+  }];
+  // #then the model inventory names the omitted cell and why it is not silently omitted
+  expect(uncalibrated).toEqual([{ admission: "scope-closing window of a recoverable running failure", ending: "retry fail or retry ok after the request is accepted", reason: "No internal hook currently runs after the live attempt's scheduler finalizer has closed and before supervise clears scheduler/machine; issuing a public request from a handler finalizer hung before a stable admission result." }]);
+});
+
 test.each(["force", "hint"])("a request admitted during a one-shot retry preserves earlier %s payload", async (mode) => {
   // #given a recoverable opening whose queued retry carries force or a source hint
   const root = await mkdtemp(join(tmpdir(), `sync-engine-live-retry-payload-${mode}-`));
