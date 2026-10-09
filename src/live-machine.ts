@@ -90,8 +90,10 @@ export type Event<C> =
   | { readonly tag: "openFail"; readonly attempt: number; readonly cause: C }
   | { readonly tag: "passClaim"; readonly pass: number; readonly changes: readonly string[] }
   | { readonly tag: "passOk"; readonly pass: number; readonly outcome: "complete" | "complete-with-errors"; readonly changes: readonly string[] }
-  | { readonly tag: "passFail"; readonly pass: number; readonly cause: C; readonly endsAttempt: boolean }
-  | { readonly tag: "attemptClosed"; readonly attempt: number };
+  /** `discharged`: the pass committed before a later step failed, so its payload is applied and not owed again. */
+  | { readonly tag: "passFail"; readonly pass: number; readonly cause: C; readonly endsAttempt: boolean; readonly discharged: boolean }
+  /** `cause` is set when closing the scope failed; it replaces the attempt's cause and includes it. */
+  | { readonly tag: "attemptClosed"; readonly attempt: number; readonly cause?: C };
 
 export type Settlement<C> = { readonly tag: "success" } | { readonly tag: "failure"; readonly cause: C } | { readonly tag: "interrupt" };
 
@@ -162,7 +164,8 @@ export function view<C>(state: Session<C>): LiveView<C> {
     case "running":
       return { ...shared, state: phase.last.tag, pass: null, followUp: null, work: { attempt: phase.attempt, fallback: "failed" } };
     case "closing":
-      return { ...shared, state: "working", pass: null, followUp: owed(phase.due !== "none"), work: { attempt: phase.attempt, fallback: "failed" } };
+      // Only an arrival starts another attempt; a carried trigger is retained, not scheduled.
+      return { ...shared, state: "working", pass: null, followUp: owed(phase.due === "arrived"), work: { attempt: phase.attempt, fallback: "failed" } };
     case "waiting":
       return { ...shared, state: "failed", pass: null, followUp: null, work: { attempt: null, fallback: "failed" } };
   }
@@ -244,10 +247,11 @@ export function step<C>(state: Session<C>, event: Event<C>): Step<C> {
   if (state.tag === "halting") {
     if (event.tag === "request") return unchanged(state, "rejected");
     if (event.tag !== "attemptClosed" || event.attempt !== state.attempt) return unchanged(state);
-    const failure: Settlement<C> = { tag: "failure", cause: state.cause };
+    const cause = event.cause ?? state.cause;
+    const failure: Settlement<C> = { tag: "failure", cause };
     const commands: Command<C>[] = [{ tag: "settleCompletion", gen: state.ids.gen, exit: failure }];
     if (state.ready === "pending") commands.push({ tag: "settleReady", exit: failure });
-    return { state: { tag: "stopped", attempt: state.attempt, failure: state.failure, availability: state.availability, recovery: state.recovery, ids: state.ids }, commands, admission: null };
+    return { state: { tag: "stopped", attempt: state.attempt, failure: cause, availability: state.availability, recovery: state.recovery, ids: state.ids }, commands, admission: null };
   }
 
   const phase = state.phase;
@@ -306,8 +310,8 @@ export function step<C>(state: Session<C>, event: Event<C>): Step<C> {
     }
     case "passFail": {
       if (phase.tag !== "passing" || phase.pass !== event.pass) return unchanged(state);
-      // The failed pass is older than anything admitted during it.
-      const owed = Payload.combine(phase.payload, state.owed);
+      // The failed pass is older than anything admitted during it. A committed pass owes nothing again.
+      const owed = event.discharged ? state.owed : Payload.combine(phase.payload, state.owed);
       if (event.endsAttempt) return endAttempt(state, phase.attempt, event.cause, phase.due, owed);
       const failed: Live<C> = { ...state, failure: event.cause };
       if (phase.due === "arrived") {
@@ -322,7 +326,8 @@ export function step<C>(state: Session<C>, event: Event<C>): Step<C> {
     }
     case "attemptClosed": {
       if (phase.tag !== "closing" || phase.attempt !== event.attempt) return unchanged(state);
-      const closed: Live<C> = { ...state, ready: "settled" };
+      const cause = event.cause ?? phase.cause;
+      const closed: Live<C> = { ...state, ready: "settled", failure: cause };
       // One rule replaces the one-shot retry: only a request admitted during the failed attempt earns another attempt.
       if (phase.due === "arrived") {
         const attempt = state.ids.attempt + 1;
@@ -333,8 +338,8 @@ export function step<C>(state: Session<C>, event: Event<C>): Step<C> {
         };
       }
       return {
-        state: { ...closed, phase: { tag: "waiting", cause: phase.cause } },
-        commands: [...readyCommands(state), { tag: "settleCompletion", gen: state.ids.gen, exit: { tag: "failure", cause: phase.cause } }],
+        state: { ...closed, phase: { tag: "waiting", cause } },
+        commands: [...readyCommands(state), { tag: "settleCompletion", gen: state.ids.gen, exit: { tag: "failure", cause } }],
         admission: null,
       };
     }

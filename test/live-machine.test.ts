@@ -5,8 +5,9 @@ import { init, invalidationTarget, Payload, step, view, type Event, type PassReq
  * Bounded-exhaustive model check of the pure live session reducer.
  *
  * The harness plays the interpreter: it sends every enabled event and executes emitted commands. Its oracle is ghost
- * state built from requests it admitted and commands it observed, never from reducer internals. After every step it
- * checks the invariants of the redesign; a violation names its invariant id in brackets, for example `[P1]`.
+ * state built from requests it admitted, events it sent and commands it observed. The reducer's phase is read only to
+ * name the step being checked and to locate the holders whose contents are compared with the ghost. After every step
+ * it checks the invariants of the redesign; a violation names its invariant id in brackets, for example `[P1]`.
  */
 
 type C = string;
@@ -14,8 +15,8 @@ type C = string;
 type Move =
   | "notify" | "force" | "plain" | "tick" | "stop" | "gapNotify" | "gapForce" | "gapEnd"
   | "usable" | "freshnessReady" | "openOk" | "openOkChange" | "openFail"
-  | "claim" | "claimChange" | "passOk" | "passOkErrors" | "passOkChange" | "passFailTyped" | "passFailEnds"
-  | "attemptClosed";
+  | "claim" | "claimChange" | "passOk" | "passOkErrors" | "passOkChange" | "passFailTyped" | "passFailEnds" | "passFailAfterCommit"
+  | "attemptClosed" | "attemptClosedFailing";
 
 interface Req {
   readonly token: string | null;
@@ -46,6 +47,8 @@ interface Ghost {
   arrivals: number;
   triggered: boolean;
   currentSettled: boolean;
+  /** Output is usable: prior output, or an accepted `usable`/`freshnessReady` event. */
+  usable: boolean;
   readySettled: number;
   firstOutcome: boolean;
   stopped: boolean;
@@ -66,7 +69,7 @@ const configs: readonly Config[] = [
   { name: "recovery without prior output", recovery: true, prior: false },
 ];
 
-const CAUSE = { open: "open failed", typed: "typed pass failure", defect: "pass defect" } as const;
+const CAUSE = { open: "open failed", typed: "typed pass failure", defect: "pass defect", trailing: "trailing step failed", close: "close failed" } as const;
 
 function start(config: Config): Ghost {
   const first = init<C>({ recovery: config.recovery, availability: config.prior ? "prior-output" : null });
@@ -82,6 +85,7 @@ function start(config: Config): Ghost {
     arrivals: 0,
     triggered: false,
     currentSettled: false,
+    usable: config.prior,
     readySettled: 0,
     firstOutcome: false,
     stopped: false,
@@ -124,11 +128,11 @@ function enabled(ghost: Ghost): Move[] {
   if (activity?.kind === "pass") {
     if (!ghost.stopped) {
       if (activity.claimed === null) moves.push("claim", "claimChange", "passFailTyped");
-      else moves.push("passOk", "passOkErrors", "passOkChange", "passFailTyped");
+      else moves.push("passOk", "passOkErrors", "passOkChange", "passFailTyped", "passFailAfterCommit");
     }
     moves.push("passFailEnds");
   }
-  if (ghost.closing !== null) moves.push("attemptClosed");
+  if (ghost.closing !== null) moves.push("attemptClosed", "attemptClosedFailing");
   return moves;
 }
 
@@ -225,14 +229,17 @@ function apply(source: Ghost, move: Move): Applied {
       break;
     }
     case "passFailTyped":
-    case "passFailEnds": {
+    case "passFailEnds":
+    case "passFailAfterCommit": {
       const activity = ghost.activity as Extract<Activity, { kind: "pass" }>;
       const ends = move === "passFailEnds";
-      event = { tag: "passFail", pass: activity.pass, cause: ends ? CAUSE.defect : CAUSE.typed, endsAttempt: ends };
+      const afterCommit = move === "passFailAfterCommit";
+      event = { tag: "passFail", pass: activity.pass, cause: ends ? CAUSE.defect : afterCommit ? CAUSE.trailing : CAUSE.typed, endsAttempt: ends, discharged: afterCommit };
       break;
     }
     case "attemptClosed":
-      event = { tag: "attemptClosed", attempt: ghost.closing! };
+    case "attemptClosedFailing":
+      event = move === "attemptClosed" ? { tag: "attemptClosed", attempt: ghost.closing! } : { tag: "attemptClosed", attempt: ghost.closing!, cause: CAUSE.close };
       break;
   }
 
@@ -271,10 +278,12 @@ function apply(source: Ghost, move: Move): Applied {
   switch (event.tag) {
     case "usable":
       if (activity?.kind === "opening") activity.usable = true;
+      if (accepted) ghost.usable = true;
       break;
     case "freshnessReady":
       if (activity?.kind === "opening") activity.fresh = true;
       ghost.freshOpen = event.attempt;
+      if (accepted) ghost.usable = true;
       break;
     case "openOk":
       if (!accepted) break;
@@ -320,7 +329,13 @@ function apply(source: Ghost, move: Move): Applied {
     }
     case "passFail": {
       if (!accepted) { ghost.activity = null; break; }
+      const pass = activity as Extract<Activity, { kind: "pass" }>;
       ghost.activity = null;
+      if (event.discharged) {
+        // The pass committed before the failure: its payload was applied and is discharged.
+        commitChecks(pass.attempt);
+        ghost.held = ghost.held.filter((req) => !req.inPass);
+      }
       for (const req of ghost.held) req.inPass = false;
       if (!event.endsAttempt) mustStartPass = ghost.held.some((req) => req.arrival);
       break;
@@ -346,13 +361,14 @@ function apply(source: Ghost, move: Move): Applied {
   // S2 and V1 on accepted outcomes.
   if (accepted && (event.tag === "openFail" || event.tag === "passFail")) {
     check(post.failure === event.cause, "S2", `failure after ${event.tag} is ${post.failure}`);
-    const fatal = !ghost.recovery || pre.availability === null;
+    const fatal = !ghost.recovery || !source.usable;
     if (event.tag === "openFail" || event.endsAttempt) check((post.tag === "halting") === fatal, "V1", `fatal decision ${post.tag} with availability ${pre.availability}`);
   } else if (accepted && (event.tag === "openOk" || event.tag === "passOk")) {
     check(post.failure === null, "S2", `failure kept after ${event.tag}`);
-  } else check(post.failure === pre.failure, "S2", `failure changed by ${event.tag}`);
+  } else if (!(event.tag === "attemptClosed" && event.cause !== undefined && pre.tag !== "stopped")) check(post.failure === pre.failure, "S2", `failure changed by ${event.tag}`);
   if (pre.availability !== null) check(post.availability === pre.availability, "V1", "availability changed after it was set");
-  if (accepted && (event.tag === "usable" || event.tag === "freshnessReady")) check(post.availability !== null, "V1", `${event.tag} left availability null`);
+  check((post.availability !== null) === ghost.usable, "V1", `availability ${post.availability} while usable output is ${ghost.usable} after ${event.tag}`);
+  if (accepted && event.tag === "attemptClosed" && event.cause !== undefined) check(post.failure === event.cause, "S2", "a failed close did not report its cause");
 
   // Admitted requests join the ghost after the step's own outcome bookkeeping.
   // A request admitted after stop is already an A1 violation; only live admissions join the ghost.
@@ -457,6 +473,7 @@ function apply(source: Ghost, move: Move): Applied {
     if (shown.state === "stopped") check(shown.pass === null && shown.followUp === null, "S1", "stopped view shows a pass or follow-up");
     if (shown.followUp !== null || shown.pass !== null) check(shown.state === "working", "S1", "a pass or follow-up is shown outside working");
     if (post.tag === "live" && (post.phase.tag === "running" || post.phase.tag === "waiting")) check(shown.followUp === null, "W1", "an idle session shows a follow-up");
+    if (post.tag === "live" && post.phase.tag === "closing" && shown.followUp !== null) check(ghost.arrivals > 0, "W1", "a closing attempt shows a follow-up that its close will not start");
   } catch (cause) {
     violations.push(`[S1] view threw: ${String(cause)}`);
   }
@@ -496,7 +513,7 @@ function canonical(ghost: Ghost): string {
   const gap = ghost.gap === null ? null : [payload(ghost.gap.payload), name(ghost.gap.token), attempt(ghost.gap.target), ghost.gap.beforeStop];
   return JSON.stringify([
     ghost.recovery, session, held, activity, attempt(ghost.closing), attempt(ghost.openAttempt), ghost.opened, attempt(ghost.freshOpen),
-    ghost.arrivals > 0, ghost.triggered, ghost.currentSettled, ghost.readySettled, ghost.firstOutcome, ghost.stopped, gap, Math.min(ghost.attemptsInGen, 3),
+    ghost.arrivals > 0, ghost.triggered, ghost.currentSettled, ghost.usable, ghost.readySettled, ghost.firstOutcome, ghost.stopped, gap, Math.min(ghost.attemptsInGen, 3),
   ]);
 }
 
@@ -567,11 +584,11 @@ const DEPTH = Number(process.env.LIVE_MODEL_DEPTH ?? 10);
 
 const requiredPairs = [
   "opening × notify", "opening × force", "opening × plain", "opening × tick", "opening × stop", "opening × usable", "opening × freshnessReady", "opening × openOk", "opening × openOkChange", "opening × openFail", "opening × gapEnd",
-  "passing × notify", "passing × force", "passing × plain", "passing × tick", "passing × stop", "passing × claim", "passing × claimChange", "passing × passOk", "passing × passOkErrors", "passing × passOkChange", "passing × passFailTyped", "passing × passFailEnds", "passing × gapEnd",
+  "passing × notify", "passing × force", "passing × plain", "passing × tick", "passing × stop", "passing × claim", "passing × claimChange", "passing × passOk", "passing × passOkErrors", "passing × passOkChange", "passing × passFailTyped", "passing × passFailEnds", "passing × passFailAfterCommit", "passing × gapEnd",
   "running × notify", "running × force", "running × plain", "running × tick", "running × stop", "running × gapEnd",
-  "closing × notify", "closing × force", "closing × plain", "closing × tick", "closing × stop", "closing × attemptClosed", "closing × gapEnd",
+  "closing × notify", "closing × force", "closing × plain", "closing × tick", "closing × stop", "closing × attemptClosed", "closing × attemptClosedFailing", "closing × gapEnd",
   "waiting × notify", "waiting × force", "waiting × plain", "waiting × tick", "waiting × stop", "waiting × gapEnd",
-  "halting × plain", "halting × attemptClosed", "halting × stop",
+  "halting × plain", "halting × attemptClosed", "halting × attemptClosedFailing", "halting × stop",
   "stopped × plain", "stopped × openFail", "stopped × passFailEnds", "stopped × attemptClosed", "stopped × gapEnd",
 ];
 

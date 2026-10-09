@@ -1,4 +1,4 @@
-import { Deferred, Effect, Exit, Fiber, Scope, type Cause } from "effect";
+import { Cause, Deferred, Effect, Exit, Fiber, Scope } from "effect";
 import { scanSource, type InitialPass, type InitialPlan, type SourceEntry, type ScanFailed, type OutputOwnershipFailed, type FreshnessFailed } from "./index.ts";
 import { openSynchronizationWithHooks, type InternalSynchronization } from "./internal.ts";
 import { INITIAL, init, invalidationTarget, Payload, step, view, type Availability, type Command, type Event, type PassAdmission, type PassRequest, type Session, type Settlement } from "./live-machine.ts";
@@ -89,7 +89,6 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
     readonly scope: Scope.Closeable;
     live?: Live;
     activity?: Fiber.Fiber<void>;
-    closed: boolean;
   }
 
   return Effect.gen(function* () {
@@ -157,9 +156,25 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
 
     const report = (event: Event<Cause.Cause<Failure>>): Effect.Effect<void> => dispatch(event).pipe(Effect.asVoid);
 
-    const opening = (attempt: number, entry: Attempt): Effect.Effect<void, never, R> => Effect.gen(function* () {
+    /**
+     * The one way an activity fiber (opening, pass or close) ends. Its body runs interruptibly under `Effect.exit`,
+     * so success, typed failure, defect, interruption, a failing finalizer the body awaits and a failing trailing
+     * step all become an exit. `outcome` turns that exit into exactly one event; if `outcome` itself fails, the pure
+     * `fallback` supplies the event. The dispatch then runs uninterruptibly, so no exit path can skip it.
+     */
+    const activity = <A, X>(
+      body: Effect.Effect<A, X, R>,
+      outcome: (exit: Exit.Exit<A, X>) => Effect.Effect<Event<Cause.Cause<Failure>>>,
+      fallback: (cause: Cause.Cause<unknown>) => Event<Cause.Cause<Failure>>,
+    ): Effect.Effect<void, never, R> => Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+      const exit = yield* Effect.exit(restore(body));
+      const event = yield* Effect.exit(outcome(exit));
+      yield* report(Exit.isSuccess(event) ? event.value : fallback(event.cause));
+    }));
+
+    const opening = (attempt: number, entry: Attempt): Effect.Effect<void, never, R> => {
       let declaredMinimum = false;
-      const opened = yield* Effect.exit(Effect.gen(function* () {
+      const body = Effect.gen(function* () {
         yield* openSynchronizationWithHooks({
           ...options,
           // A plan that declares no minimum has published nothing usable when `onMinimum` runs.
@@ -180,21 +195,28 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
         // The traversal after the first pass belongs to the open: a change it finds is already due when `ready` settles.
         const afterInitial = yield* scanSource(options.sourcePath, options.includeSource);
         return differences(baseline, afterInitial);
-      }));
-      yield* report(Exit.isSuccess(opened) ? { tag: "openOk", attempt, changes: opened.value } : { tag: "openFail", attempt, cause: opened.cause });
-    });
+      });
+      return activity(
+        body,
+        (exit) => Effect.succeed(Exit.isSuccess(exit) ? { tag: "openOk", attempt, changes: exit.value } : { tag: "openFail", attempt, cause: exit.cause }),
+        (cause) => ({ tag: "openFail", attempt, cause: cause as Cause.Cause<Failure> }),
+      );
+    };
 
     const startAttempt = (attempt: number): Effect.Effect<void> => Effect.gen(function* () {
       // The machine starts an attempt only after the previous one closed, so older entries hold no resources.
       for (const key of attempts.keys()) if (key < attempt) attempts.delete(key);
-      const entry: Attempt = { scope: yield* Scope.make(), closed: false };
+      const entry: Attempt = { scope: yield* Scope.make() };
       attempts.set(attempt, entry);
       entry.activity = yield* track(opening(attempt, entry));
     });
 
-    const runPass = (attempt: number, pass: number): Effect.Effect<void, never, R> => Effect.gen(function* () {
-      const live = attempts.get(attempt)!.live!;
-      const exit = yield* Effect.exit(Effect.gen(function* () {
+    const runPass = (attempt: number, pass: number): Effect.Effect<void, never, R> => {
+      const entry = attempts.get(attempt)!;
+      // Set once the pass committed freshness: from then on its payload is applied, whatever fails afterwards.
+      let committed = false;
+      const body = Effect.gen(function* () {
+        const live = entry.live!;
         const entries = yield* scanSource(options.sourcePath, options.includeSource);
         const { claimed: declared } = yield* dispatch({ tag: "passClaim", pass, changes: differences(baseline, entries) });
         // Only a stopped session refuses the claim; the pass then declares nothing.
@@ -204,37 +226,46 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
         yield* live.awaitCompletion;
         yield* plan.publish;
         yield* live.commitFreshness;
+        committed = true;
         baseline = entries;
         const outcome = (yield* live.status).state === "complete-with-errors" ? "complete-with-errors" as const : "complete" as const;
         const after = yield* scanSource(options.sourcePath, options.includeSource);
         return { outcome, changes: differences(entries, after) };
-      }));
-      if (Exit.isSuccess(exit)) return yield* report({ tag: "passOk", pass, ...exit.value });
-      // Typed failures keep the attempt; a defect, an interruption or a failed scheduler ends it.
-      const endsAttempt = exit.cause.reasons.some((reason) => reason._tag !== "Fail") || (yield* live.status).state === "failed";
-      yield* report({ tag: "passFail", pass, cause: exit.cause, endsAttempt });
-    });
+      }).pipe(Scope.provide(entry.scope));
+      return activity(
+        body,
+        (exit) => Exit.isSuccess(exit)
+          ? Effect.succeed({ tag: "passOk", pass, ...exit.value })
+          // Typed failures keep the attempt; a defect, an interruption or a failed scheduler ends it.
+          : Effect.gen(function* () {
+            const schedulerFailed = entry.live !== undefined && (yield* entry.live.status).state === "failed";
+            const endsAttempt = exit.cause.reasons.some((reason) => reason._tag !== "Fail") || schedulerFailed;
+            return { tag: "passFail", pass, cause: exit.cause, endsAttempt, discharged: committed } as const;
+          }),
+        (cause) => ({ tag: "passFail", pass, cause: cause as Cause.Cause<Failure>, endsAttempt: true, discharged: committed }),
+      );
+    };
 
     const startPass = (attempt: number, pass: number): Effect.Effect<void> => Effect.gen(function* () {
       const entry = attempts.get(attempt)!;
       entry.activity = yield* track(runPass(attempt, pass));
     });
 
-    const closeEntry = (entry: Attempt, exit: Exit.Exit<unknown, unknown>) => Effect.suspend(() => {
-      if (entry.closed) return Effect.void;
-      entry.closed = true;
-      return Scope.close(entry.scope, exit);
-    });
-
-    const closeAttempt = (attempt: number, cause: Cause.Cause<Failure>): Effect.Effect<void> => Effect.gen(function* () {
-      const entry = attempts.get(attempt)!;
-      // The activity reported this failure as its last act; wait for it so nothing runs once the lease is released.
-      if (entry.activity !== undefined) yield* Fiber.await(entry.activity);
-      if (internal.beforeAttemptClose) yield* internal.beforeAttemptClose(attempt);
-      yield* closeEntry(entry, Exit.failCause(cause));
-      if (internal.afterAttemptClose) yield* internal.afterAttemptClose(attempt);
-      yield* report({ tag: "attemptClosed", attempt });
-    });
+    const closeAttempt = (attempt: number, cause: Cause.Cause<Failure>): Effect.Effect<void, never, R> => {
+      const body = Effect.gen(function* () {
+        const entry = attempts.get(attempt)!;
+        // The activity reported this failure as its last act; wait for it so nothing runs once the lease is released.
+        if (entry.activity !== undefined) yield* Fiber.await(entry.activity);
+        if (internal.beforeAttemptClose) yield* internal.beforeAttemptClose(attempt);
+        // Finalizers finish even if the session stops meanwhile: a half-closed scope could keep the lease.
+        yield* Scope.close(entry.scope, Exit.failCause(cause)).pipe(Effect.uninterruptible);
+        if (internal.afterAttemptClose) yield* internal.afterAttemptClose(attempt);
+      });
+      // A failing finalizer, such as a rejected lease release, still closes the attempt; its cause joins the attempt's.
+      const closed = (failure: Cause.Cause<unknown> | null): Event<Cause.Cause<Failure>> =>
+        failure === null ? { tag: "attemptClosed", attempt } : { tag: "attemptClosed", attempt, cause: Cause.combine(cause, failure as Cause.Cause<Failure>) };
+      return activity(body, (exit) => Effect.succeed(closed(Exit.isSuccess(exit) ? null : exit.cause)), (failure) => closed(failure));
+    };
 
     const request = (payload: Payload): Effect.Effect<PassAdmission> => Effect.gen(function* () {
       // Invalidate before the admission step: a commit after admission then cannot record a read older than the hint.
@@ -251,7 +282,8 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
     });
 
     // Finalizers run in reverse: admission stops first, then activities are joined, then attempt scopes release leases.
-    yield* Effect.addFinalizer(() => Effect.forEach([...attempts.values()], (entry) => closeEntry(entry, Exit.void), { discard: true }));
+    // `Scope.close` is idempotent, so a scope its failed attempt already closed is skipped.
+    yield* Effect.addFinalizer(() => Effect.forEach([...attempts.values()], (entry) => Scope.close(entry.scope, Exit.void), { discard: true }));
     yield* Effect.addFinalizer(() => Fiber.interruptAll([...fibers]));
     if ((options.reconcileIntervalMs ?? 0) > 0) {
       yield* Effect.forkScoped(Effect.forever(Effect.sleep(options.reconcileIntervalMs!).pipe(Effect.andThen(report({ tag: "tick" })))));

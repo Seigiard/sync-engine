@@ -1759,29 +1759,66 @@ test.each(["before attempt close", "after attempt close"] as const)("requests in
 });
 
 test("a fatal first pass fails ready only after the output lease is released", async () => {
-  // #given a cold session without recovery whose first pass fails
+  // #given a cold session without recovery whose first pass fails, with the attempt close observed
   const root = await mkdtemp(join(tmpdir(), "sync-engine-live-fatal-lease-"));
   const sourcePath = join(root, "source");
   const outputPath = join(root, "output");
   await mkdir(sourcePath);
   await Bun.write(join(sourcePath, "document"), "Original");
+  const order: string[] = [];
   try {
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const session = yield* startLiveSynchronization({
+      const session = yield* startLiveSynchronizationWithHooks({
         sourcePath,
         outputPath,
         declare: () => Effect.succeed({ work: ["document"], publish: Effect.void }),
         handle: () => Effect.fail(new Error("first pass failed")),
+      }, {
+        beforeAttemptClose: () => Effect.sync(() => { order.push("closing attempt"); }),
+        afterAttemptClose: () => Effect.sync(() => { order.push("attempt scope closed"); }),
       });
       // #when ready fails, the caller immediately takes the output lease as a restart would
       const ready = yield* Effect.exit(session.ready);
-      const startedAt = Date.now();
+      order.push("ready failed");
       const lease = yield* Effect.exit(acquireOutputTree(outputPath));
       if (Exit.isSuccess(lease)) yield* Effect.promise(lease.value);
-      return { readyFailed: Exit.isFailure(ready), lease: Exit.isSuccess(lease) ? "acquired" : "contended", waitedUnderSecond: Date.now() - startedAt < 1000, admission: yield* session.requestPass() };
+      return { readyFailed: Exit.isFailure(ready), lease: Exit.isSuccess(lease) ? "acquired" : "contended", admission: yield* session.requestPass() };
     })));
-    // #then the lease is free without contention and admission is already closed
-    expect(result).toEqual({ readyFailed: true, lease: "acquired", waitedUnderSecond: true, admission: "rejected" });
+    // #then the attempt scope, which holds the lease, closed before ready failed, and admission is closed
+    expect({ ...result, order }).toEqual({ readyFailed: true, lease: "acquired", admission: "rejected", order: ["closing attempt", "attempt scope closed", "ready failed"] });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("scoped resources of a later pass are released when its failed attempt closes", async () => {
+  // #given a recoverable session whose later declaration acquires a scoped resource and whose publication dies
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-pass-scope-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "document"), "Original");
+  const resource = { acquired: 0, released: 0 };
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* openLiveSynchronization({
+        sourcePath,
+        outputPath,
+        reconcileIntervalMs: 0,
+        recovery: { existing: Effect.succeed(true) },
+        declare: (_entries, request) => request.kind === "initial"
+          ? Effect.succeed({ work: ["document"], publish: Effect.void })
+          : Effect.acquireRelease(Effect.sync(() => { resource.acquired += 1; }), () => Effect.sync(() => { resource.released += 1; }))
+            .pipe(Effect.as({ work: ["document"], publish: Effect.die("publication defect") })),
+        handle: (path: string) => io(async () => { await Bun.write(join(outputPath, path), await readFile(join(sourcePath, path), "utf8")); return [] as string[]; }),
+      });
+      // #when the later pass dies and its attempt closes while the session stays open
+      yield* session.requestPass();
+      const completion = yield* Effect.exit(session.awaitCompletion);
+      return { failed: Exit.isFailure(completion), state: (yield* session.status).state, resource: { ...resource } };
+    })));
+    // #then the resource belonged to the failed attempt, not to the whole session
+    expect(result).toEqual({ failed: true, state: "failed", resource: { acquired: 1, released: 1 } });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
