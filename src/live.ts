@@ -87,6 +87,8 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
   type Live = InternalSynchronization<W, E | FreshnessFailed>;
   interface Attempt {
     readonly scope: Scope.Closeable;
+    /** Parent of every later pass's scope. Forked during the initial declaration, so it closes after the scheduler stops and before the lease is released. */
+    passes?: Scope.Closeable;
     live?: Live;
     activity?: Fiber.Fiber<void>;
   }
@@ -179,10 +181,13 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
           ...options,
           // A plan that declares no minimum has published nothing usable when `onMinimum` runs.
           onMinimum: Effect.suspend(() => declaredMinimum ? report({ tag: "usable", attempt }) : Effect.void).pipe(Effect.andThen(options.onMinimum ?? Effect.void)),
-          declare: (entries) => {
+          declare: (entries) => Effect.gen(function* () {
             baseline = entries;
-            return options.declare(entries, INITIAL).pipe(Effect.tap((plan) => Effect.sync(() => { declaredMinimum = (plan.minimum?.length ?? 0) > 0; })));
-          },
+            entry.passes = yield* Scope.fork(entry.scope);
+            const plan = yield* options.declare(entries, INITIAL);
+            declaredMinimum = (plan.minimum?.length ?? 0) > 0;
+            return plan;
+          }),
         }, {
           deferCommit: true,
           beforeCommit: (live) => Effect.gen(function* () {
@@ -215,7 +220,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
       const entry = attempts.get(attempt)!;
       // Set once the pass committed freshness: from then on its payload is applied, whatever fails afterwards.
       let committed = false;
-      const body = Effect.gen(function* () {
+      const steps = Effect.gen(function* () {
         const live = entry.live!;
         const entries = yield* scanSource(options.sourcePath, options.includeSource);
         const { claimed: declared } = yield* dispatch({ tag: "passClaim", pass, changes: differences(baseline, entries) });
@@ -231,7 +236,17 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
         const outcome = (yield* live.status).state === "complete-with-errors" ? "complete-with-errors" as const : "complete" as const;
         const after = yield* scanSource(options.sourcePath, options.includeSource);
         return { outcome, changes: differences(entries, after) };
-      }).pipe(Scope.provide(entry.scope));
+      });
+      const body = Effect.gen(function* () {
+        const scope = yield* Scope.fork(entry.passes!);
+        const exit = yield* Effect.exit(steps.pipe(Scope.provide(scope)));
+        // A handler still in flight (another worker died, or the session stops) may use what the pass acquired; the
+        // attempt close then releases it once the scheduler's workers stopped. Otherwise the pass releases it now.
+        if ((yield* entry.live!.status).active !== null) return yield* exit;
+        const closed = yield* Effect.exit(Scope.close(scope, exit));
+        if (Exit.isSuccess(closed)) return yield* exit;
+        return yield* Effect.failCause(Exit.isFailure(exit) ? Cause.combine(exit.cause, closed.cause) : closed.cause);
+      });
       return activity(
         body,
         (exit) => Exit.isSuccess(exit)

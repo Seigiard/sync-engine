@@ -208,7 +208,11 @@ The returned session exposes:
 A pass remains active until required work and final publication finish. Typed
 required-work failures in a later pass produce `complete-with-errors`; final
 publication still runs, prior results for failed work remain, and the errors stay
-visible in `status.work.errors`. A defect or interruption in any pass ends the current
+visible in `status.work.errors`. Scoped resources that a later `declare` or `publish`
+acquires belong to that pass and are released when it ends. If one of its handlers is still
+running then (another worker died, or the session stops), they are released when the attempt
+closes, after the scheduler stopped its handlers and before the lease is released.
+A defect or interruption in any pass ends the current
 attempt, releases the output lease, and follows the recovery policy below. Requests
 during that interval guarantee a follow-up. Pending requests combine, retaining
 every dirty path and any forced mode. A post-processing traversal detects source

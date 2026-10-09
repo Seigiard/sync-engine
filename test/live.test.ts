@@ -1823,3 +1823,76 @@ test("scoped resources of a later pass are released when its failed attempt clos
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("a later pass's resources are released only after the scheduler stopped the handlers still using them", async () => {
+  // #given two workers: one handler of a later pass is still running when the other dies
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-pass-order-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "document"), "Original");
+  const order: string[] = [];
+  const running = gate();
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* openLiveSynchronization({
+        sourcePath,
+        outputPath,
+        concurrency: 2,
+        reconcileIntervalMs: 0,
+        recovery: { existing: Effect.succeed(true) },
+        declare: (_entries, request) => request.kind === "initial"
+          ? Effect.succeed({ work: ["document"], publish: Effect.void })
+          : Effect.acquireRelease(Effect.void, () => Effect.sync(() => { order.push("pass resource released"); }))
+            .pipe(Effect.as({ work: ["still running", "dies"], publish: Effect.void })),
+        handle: (work: string) => {
+          if (work === "still running") return Effect.sync(() => running.open()).pipe(Effect.andThen(Effect.never), Effect.onInterrupt(() => Effect.sync(() => { order.push("handler stopped"); })));
+          if (work === "dies") return Effect.promise(() => running.promise).pipe(Effect.andThen(Effect.die("handler defect")));
+          return io(async () => { await Bun.write(join(outputPath, work), await readFile(join(sourcePath, work), "utf8")); return [] as string[]; });
+        },
+      });
+      // #when the scheduler fails while the other handler is in flight, and the failed attempt closes
+      yield* session.requestPass();
+      const completion = yield* Effect.exit(session.awaitCompletion);
+      return { failed: Exit.isFailure(completion), order: [...order] };
+    })));
+    // #then the running handler is stopped before the resource it may use is released
+    expect(result).toEqual({ failed: true, order: ["handler stopped", "pass resource released"] });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a successful later pass releases its scoped resources when it ends", async () => {
+  // #given a healthy session whose later declarations each acquire a scoped resource
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-pass-release-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "document"), "Original");
+  const resource = { acquired: 0, released: 0 };
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* openLiveSynchronization({
+        sourcePath,
+        outputPath,
+        reconcileIntervalMs: 0,
+        declare: (_entries, request) => request.kind === "initial"
+          ? Effect.succeed({ work: ["document"], publish: Effect.void })
+          : Effect.acquireRelease(Effect.sync(() => { resource.acquired += 1; }), () => Effect.sync(() => { resource.released += 1; }))
+            .pipe(Effect.as({ work: ["document"], publish: Effect.void })),
+        handle: (path: string) => io(async () => { await Bun.write(join(outputPath, path), await readFile(join(sourcePath, path), "utf8")); return [] as string[]; }),
+      });
+      // #when three later passes succeed while the session stays open
+      for (let pass = 0; pass < 3; pass += 1) {
+        yield* session.requestPass();
+        yield* session.awaitCompletion;
+      }
+      return { state: (yield* session.status).state, resource: { ...resource } };
+    })));
+    // #then no pass holds its resource after it ended
+    expect(result).toEqual({ state: "complete", resource: { acquired: 3, released: 3 } });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
