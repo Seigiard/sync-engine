@@ -1,4 +1,4 @@
-import { Data, Effect, type Scope } from "effect";
+import { Data, Deferred, Effect, Exit, type Scope } from "effect";
 import { acquireOutputTree, canonicalDestination, engineStatePath, OutputOwnershipFailed } from "./ownership.ts";
 export { acquireOutputTree, engineStatePath, OutputOwnershipFailed } from "./ownership.ts";
 import { createWorkScheduler, type WorkOptions, type WorkScheduler } from "./work.ts";
@@ -43,6 +43,7 @@ export interface InitialPass<W, E, R> extends WorkOptions<W, E, R> {
 }
 
 interface OpenSynchronizationInternal<W, E, R> {
+  readonly deferCommit?: boolean;
   readonly beforeCommit?: (synchronization: Synchronization<W, E | FreshnessFailed>) => Effect.Effect<void, E | FreshnessFailed, R>;
 }
 
@@ -128,7 +129,25 @@ export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>, inte
     const freshness = yield* openFreshness(options, statePath);
     const scheduler = yield* createWorkScheduler({ ...options, handle: freshness.handle });
     let closed = false;
-    yield* Effect.addFinalizer(() => Effect.sync(() => { closed = true; }));
+    let inFlightFreshness = 0;
+    let freshnessIdle = Deferred.makeUnsafe<void>();
+    Deferred.doneUnsafe(freshnessIdle, Effect.void);
+    const trackFreshness = (effect: Effect.Effect<void, E | FreshnessFailed>) => {
+      return Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+        if (closed) return yield* Effect.interrupt;
+        if (inFlightFreshness === 0) freshnessIdle = Deferred.makeUnsafe<void>();
+        inFlightFreshness += 1;
+        const exit = yield* Effect.exit(restore(effect));
+        inFlightFreshness -= 1;
+        if (inFlightFreshness === 0) Deferred.doneUnsafe(freshnessIdle, Effect.void);
+        if (Exit.isFailure(exit)) return yield* Effect.failCause(exit.cause);
+        return exit.value;
+      }));
+    };
+    yield* Effect.addFinalizer(() => Effect.gen(function* () {
+      closed = true;
+      yield* Deferred.await(freshnessIdle);
+    }));
     if (plan.minimum !== undefined && plan.minimum.length > 0) {
       yield* scheduler.submit(plan.minimum);
       yield* scheduler.awaitCompletion;
@@ -140,10 +159,12 @@ export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>, inte
     yield* scheduler.awaitCompletion;
     const completed = yield* scheduler.status;
     if (completed.errors.length > 0) return yield* Effect.failCause(completed.errors[0]!.cause);
-    const synchronization: Synchronization<W, E | FreshnessFailed> = {
+    const commitFreshness = trackFreshness(freshness.commit);
+    const synchronization = {
       ...scheduler,
-      submit: (work: readonly W[], input?: WorkInput) => Effect.suspend(() => closed ? Effect.interrupt : (input === undefined ? freshness.invalidateWork(work) : freshness.invalidate(input)).pipe(Effect.andThen(scheduler.submit(work)))),
-      awaitCompletion: Effect.suspend(() => closed ? Effect.interrupt : scheduler.awaitCompletion.pipe(Effect.andThen(Effect.suspend(() => closed ? Effect.interrupt : freshness.commit)))),
+      submit: (work: readonly W[], input?: WorkInput) => Effect.suspend(() => closed ? Effect.interrupt : trackFreshness(input === undefined ? freshness.invalidateWork(work) : freshness.invalidate(input)).pipe(Effect.andThen(scheduler.submit(work)))),
+      awaitCompletion: Effect.suspend(() => closed ? Effect.interrupt : scheduler.awaitCompletion.pipe(Effect.andThen(Effect.suspend(() => closed ? Effect.interrupt : internal?.deferCommit ? Effect.void : commitFreshness)))),
+      commitFreshness,
     };
     yield* plan.publish;
     if (internal?.beforeCommit) yield* internal.beforeCommit(synchronization);

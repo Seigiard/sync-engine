@@ -61,6 +61,10 @@ export interface LiveHandle<W, E> extends LiveSynchronization<W, E> {
   readonly ready: Effect.Effect<void, E | ScanFailed>;
 }
 
+interface LiveInternalSynchronization<W, E> extends Synchronization<W, E> {
+  readonly commitFreshness: Effect.Effect<void, E>;
+}
+
 const INITIAL: PassRequest = { kind: "initial", force: false, changedPaths: [] };
 
 function differences(before: readonly SourceEntry[], after: readonly SourceEntry[]): string[] {
@@ -79,7 +83,11 @@ function differences(before: readonly SourceEntry[], after: readonly SourceEntry
  * Owns scan, processing, required publication, follow-up, the periodic timer and the retry of a failed attempt.
  * The handle is usable at once: requests made before the first pass finished combine and run after it.
  */
-export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>, internal: LiveInternalHooks = {}): Effect.Effect<LiveHandle<W, E | FreshnessFailed | OutputOwnershipFailed>, never, R | Scope.Scope> {
+export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>): Effect.Effect<LiveHandle<W, E | FreshnessFailed | OutputOwnershipFailed>, never, R | Scope.Scope> {
+  return startLiveSynchronizationWithHooks(options);
+}
+
+export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<W, E, R>, internal: LiveInternalHooks = {}): Effect.Effect<LiveHandle<W, E | FreshnessFailed | OutputOwnershipFailed>, never, R | Scope.Scope> {
   type Failure = E | FreshnessFailed | ScanFailed | OutputOwnershipFailed;
   type MachineState = "opening" | "running" | "retrying-after-failed-opening" | "reopening" | "stopped-fatal" | "stopped";
 
@@ -94,6 +102,7 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>,
     let state: LiveStatus<W>["state"] = "working";
     let pending: PassRequest | null = null;
     let retryAfterFailedOpening: PassRequest | null = null;
+    let reopenTrigger: PassRequest | null = null;
     let active: PassRequest | null = null;
     let carriedChangedPaths = new Set<string>();
     let carriedForce = false;
@@ -134,6 +143,7 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>,
     const clearQueued = () => {
       pending = null;
       retryAfterFailedOpening = null;
+      reopenTrigger = null;
       carriedChangedPaths = new Set<string>();
       carriedForce = false;
       openingChangedPaths = new Set<string>();
@@ -188,6 +198,7 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>,
       yield* live.submit(plan.work, active);
       yield* live.awaitCompletion;
       yield* plan.publish;
+      yield* (live as LiveInternalSynchronization<W, E | FreshnessFailed>).commitFreshness;
       baseline = entries;
       const after = yield* scanSource(options.sourcePath, options.includeSource);
       const changed = differences(entries, after);
@@ -238,6 +249,7 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>,
               return options.declare(entries, INITIAL).pipe(Effect.tap((plan) => Effect.sync(() => { declaredMinimum = (plan.minimum?.length ?? 0) > 0; })));
             },
           }, {
+            deferCommit: true,
             beforeCommit: (live) => Effect.gen(function* () {
               availability ??= "minimum-publication";
               openingScheduler = live;
@@ -261,6 +273,10 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>,
           mergePending(retryAfterFailedOpening);
           retryAfterFailedOpening = null;
         }
+        if (reopenTrigger !== null) {
+          mergePending(reopenTrigger);
+          reopenTrigger = null;
+        }
         const initialChanges = differences(baseline, opened.value.afterInitial);
         if (initialChanges.length > 0) mergePending({ kind: "watcher", force: false, changedPaths: initialChanges });
         consumeOpeningInvalidation();
@@ -274,6 +290,11 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>,
 
     const supervise = Effect.gen(function* () {
       while (true) {
+        const attemptWasOneShotRetry = retryAfterFailedOpening !== null;
+        if (machine === "reopening" && retryAfterFailedOpening === null && pending !== null) {
+          reopenTrigger = pending;
+          pending = null;
+        }
         machine = retryAfterFailedOpening === null ? "opening" : "retrying-after-failed-opening";
         const attemptExit = yield* Effect.exit(attempt);
         const cause = Exit.isFailure(attemptExit) ? attemptExit.cause as Cause.Cause<Failure> : attemptExit.value;
@@ -284,6 +305,7 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>,
         // Without usable output a served-but-empty deployment would be a lie.
         const fatal = options.recovery === undefined || availability === null;
         const retryNow = !fatal && retryAfterFailedOpening === null && pending !== null;
+        const wakeNewerPending = !fatal && attemptWasOneShotRetry && pending !== null;
         // Settle the flags before any Deferred: a waiter may resume inline and must see a consistent session.
         if (fatal) {
           machine = "stopped-fatal";
@@ -299,7 +321,12 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>,
           retryAfterFailedOpening = null;
           if (!fatal) machine = "reopening";
           yield* drainWake;
-          Deferred.doneUnsafe(completion, Effect.failCause(cause));
+          if (wakeNewerPending) {
+            state = "working";
+            Queue.offerUnsafe(wake, undefined);
+          } else {
+            Deferred.doneUnsafe(completion, Effect.failCause(cause));
+          }
         }
 
         if (fatal) {
@@ -308,7 +335,7 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>,
         }
         Deferred.doneUnsafe(ready, Effect.void);
         Deferred.doneUnsafe(settled, Effect.void);
-        if (!retryNow) {
+        if (!retryNow && !wakeNewerPending) {
           yield* Queue.take(wake);
         }
       }

@@ -72,6 +72,11 @@ export function observeSourcePath(sourcePath: string, path: string, fs: SourceFi
           return { state: "absent" };
         }
         if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw new Error("Unsupported source path");
+        if (current !== target && info.isFile()) {
+          const confirmedRoot = await fs.lstat(root);
+          if (!confirmedRoot.isDirectory() || confirmedRoot.isSymbolicLink()) throw new Error("Source root is unavailable");
+          return { state: "absent" };
+        }
         if (current !== target && !info.isDirectory()) throw new Error("Source ancestor is not a directory");
       }
       return { state: "present", entry: { path: relative(root, target), kind: info.isDirectory() ? "directory" : "file", size: info.size, mtimeMs: info.mtimeMs } };

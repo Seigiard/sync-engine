@@ -288,6 +288,38 @@ test("a failed freshness save does not poison later saves in the same session", 
   }
 });
 
+test("freshness handle does not rewrite unchanged state after leaf work", async () => {
+  // #given a described leaf item whose invalidation save already recorded every state change
+  const root = await mkdtemp(join(tmpdir(), "sync-freshness-noop-save-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const statePath = join(root, "state");
+  await mkdir(sourcePath);
+  await mkdir(outputPath);
+  await Bun.write(join(sourcePath, "note.txt"), "Original source");
+  try {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const freshness = yield* openFreshness({
+        sourcePath,
+        outputPath,
+        freshness: { describe: () => ({ sourcePaths: ["note.txt"], resultKind: "note", processingVersion: "v1", outputPaths: ["note"] }) },
+        handle: () => io(async () => {
+          await Bun.write(join(outputPath, "note"), "Prepared");
+          await rm(statePath, { recursive: true, force: true });
+          return [] as string[];
+        }),
+      }, statePath);
+      // #when leaf work returns no downstream invalidations after the first save
+      const handled = yield* freshness.handle("note").pipe(Effect.as("handled"), Effect.catchTag("FreshnessFailed", () => Effect.succeed("failed")));
+      return { handled, output: yield* io(() => readFile(join(outputPath, "note"), "utf8")) };
+    }));
+    // #then no second identical freshness write is required after the handler
+    expect(result).toEqual({ handled: "handled", output: "Prepared" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a closed synchronization handle cannot rewrite retained freshness", async () => {
   // #given a scoped session that recorded freshness in an explicit state directory
   const { root, options } = await textTree();

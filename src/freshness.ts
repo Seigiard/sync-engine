@@ -137,11 +137,15 @@ export function openFreshness<W, E, R>(
         const revision = key === undefined ? 0 : revisions.get(key)!;
         const downstream = yield* options.handle(work);
         // A returned dependency must run even when its own source stamp is unchanged.
+        let invalidatedDownstream = false;
         for (const item of downstream) {
           const dependent = options.freshness?.describe(item);
-          if (dependent) invalidateKey(identity(dependent));
+          if (dependent) {
+            invalidateKey(identity(dependent));
+            invalidatedDownstream = true;
+          }
         }
-        yield* io(save);
+        if (invalidatedDownstream) yield* io(save);
         if (descriptor && key !== undefined && before !== undefined) {
           const after = yield* io(() => stamp(descriptor));
           const present = yield* io(() => outputsExist(descriptor));

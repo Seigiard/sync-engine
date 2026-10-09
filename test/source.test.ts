@@ -31,6 +31,26 @@ test("an incomplete source observation retains results but confirmed removal per
   }
 });
 
+test("a regular file ancestor confirms descendant absence for associated cleanup", async () => {
+  // #given output for a source descendant whose parent path is now a regular file
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-source-file-ancestor-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  await mkdir(join(outputPath, "folder"), { recursive: true });
+  await Bun.write(join(sourcePath, "folder"), "not a directory");
+  await Bun.write(join(outputPath, "folder", "book"), "Previous result");
+  try {
+    // #when cleanup observes folder/book through the regular-file ancestor folder
+    const observation = await Effect.runPromise(observeSourcePath(sourcePath, "folder/book"));
+    const removed = await Effect.runPromise(removeAssociatedOutputs({ sourcePath, outputPath, sourceRelativePath: "folder/book", outputs: ["folder/book"] }));
+    // #then the descendant is confirmed absent and stale output can be removed
+    expect({ state: observation.state, removed, exists: await Bun.file(join(outputPath, "folder", "book")).exists() }).toEqual({ state: "absent", removed: true, exists: false });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("cleanup rejects traversal, root removal and symlink ancestors without touching unrelated data", async () => {
   // #given user data outside the dedicated output and an alias from inside it
   const root = await mkdtemp(join(tmpdir(), "sync-engine-confinement-"));
