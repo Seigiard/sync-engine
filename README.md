@@ -95,14 +95,14 @@ the live API owns resync scheduling and reconciliation. `concurrency` defaults t
 ## Minimum readiness
 
 An `InitialPlan` may declare `minimum` work beside `work`. The initial pass runs
-the minimum first. A minimum that cannot finish fails the open at once, before
-the remaining work starts. When it drains without errors the engine runs the
+the minimum first. A typed minimum failure is reported after the minimum work drains,
+and before the remaining work starts. When it drains without errors the engine runs the
 optional `onMinimum` Effect, then submits `work`. The application decides what
 the minimum is and what "ready" means; the engine reports only that the minimum
 finished. Completion still waits for all required work. A plan without `minimum`
 runs `onMinimum` right after declaration. Later live passes ignore `minimum`;
 list work that must repeat in `work` as well. `LiveStatus.failure` carries the
-cause of the last failed pass until a later pass succeeds.
+cause of the last recoverable failed pass or open until a later attempt succeeds.
 
 ## Freshness
 
@@ -202,7 +202,8 @@ The returned session exposes:
 A pass remains active until required work and final publication finish. Typed
 required-work failures in a later pass produce `complete-with-errors`; final
 publication still runs, prior results for failed work remain, and the errors stay
-visible in `status.work.errors`. Requests
+visible in `status.work.errors`. A defect or interruption in any pass ends the current
+attempt, releases the output lease, and follows the recovery policy below. Requests
 during that interval guarantee a follow-up. Pending requests combine, retaining
 every dirty path and any forced mode. A post-processing traversal detects source
 size, mtime, kind and membership changes and requests repair before completion.
@@ -212,14 +213,14 @@ processing; traversal does not provide a filesystem snapshot.
 `reconcileIntervalMs` enables the scoped timer; zero disables it. Scope closure
 stops the timer and pass consumer before the work scheduler releases its lease.
 
-## First-pass failure map and retry
+## Attempt failure map and retry
 
-`startLiveSynchronization(options)` returns a `LiveHandle` at once and runs the first pass in the
+`startLiveSynchronization(options)` returns a `LiveHandle` at once and runs the first attempt in the
 background. `openLiveSynchronization` is `start` plus `ready`. `ready` settles when the first pass
 did. Requests made before that (`requestPass`, `notify`) report `queued`, combine, and run as one
 follow-up pass after the open, keeping force and every hint.
 
-Without `recovery` a failed first pass fails `ready`. With
+Without `recovery` a failed first pass or later pass defect stops the session. With
 `recovery: { existing }` the engine tolerates it while output is usable: `existing` reports earlier
 output that already serves (read once before the first pass), and a published `minimum` counts
 too. `status.availability` reports `"prior-output"`, `"minimum-publication"` or `null`. A tolerated
@@ -227,7 +228,7 @@ failure resolves `ready`, sets `status.failure` and `state: "failed"`, releases 
 The next `requestPass`/`notify` (reports `started`) or reconcile tick reopens the session in the
 same scope: a full first pass again, then any retained request. A disabled timer
 (`reconcileIntervalMs: 0`) leaves only requests as retry triggers. Without usable output `ready` fails
-and the application decides whether that is fatal. This is the one owner of retry and reconcile
+for the first pass, or a later attempt stops admission. This is the one owner of retry and reconcile
 scheduling; applications keep no timer of their own.
 
 ## Cooperative shutdown and restart

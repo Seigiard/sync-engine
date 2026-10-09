@@ -146,19 +146,23 @@ export function createWorkScheduler<W, E, R>(options: WorkOptions<W, E, R>): Eff
     }));
 
     return {
-      submit: (work) => Effect.gen(function* () {
+      submit: (work) => Effect.suspend(() => {
         if (failure !== undefined) return Effect.failCause(failure);
         if (state === "stopped") return Effect.interrupt;
         if (work.length === 0) return Effect.void;
-        const wasComplete = state === "complete" || state === "complete-with-errors";
-        if (wasComplete) completion = Deferred.makeUnsafe<void, E>();
-        state = "working";
-        const exit = yield* Effect.exit(Effect.sync(() => enqueue(work)));
-        if (Exit.isFailure(exit)) {
-          failDefect(exit.cause);
-          return yield* Effect.failCause(exit.cause);
-        }
-        wakeWorkers();
+        return Effect.gen(function* () {
+          const exit = yield* Effect.exit(Effect.sync(() => {
+            const wasComplete = state === "complete" || state === "complete-with-errors";
+            if (wasComplete) completion = Deferred.makeUnsafe<void, E>();
+            state = "working";
+            enqueue(work);
+            wakeWorkers();
+          }));
+          if (Exit.isFailure(exit)) {
+            failDefect(exit.cause);
+            return yield* Effect.failCause(exit.cause);
+          }
+        });
       }),
       awaitCompletion: Effect.suspend(() => Deferred.await(completion)),
       status: Effect.sync(() => ({ state, pending: pending.length, active: active.length === 0 ? null : active[0]!, errors: [...errors] })),

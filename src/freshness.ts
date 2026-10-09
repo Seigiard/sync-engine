@@ -87,8 +87,8 @@ export function openFreshness<W, E, R>(
         let info;
         try { info = await lstat(absolute); }
         catch (cause) {
-          // A vanished source is a stamp of its own, never equal to a recorded one. Whether it is really gone is the
-          // handler's to confirm; failing here would turn one removal into a failed pass.
+          // A vanished source differs from a prior present source. If a handler confirms absence successfully,
+          // the absent stamp can be retained until the source returns.
           if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") { sources.push([source, null, null, null]); continue; }
           throw cause;
         }

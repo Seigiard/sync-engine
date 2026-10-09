@@ -19,7 +19,7 @@ export interface LiveOptions<W, E, R> extends Omit<InitialPass<W, E, R>, "declar
   /** Zero disables the owned periodic timer. */
   readonly reconcileIntervalMs?: number;
   /**
-   * Opt-in failure map for the first pass. Without it a failed first pass fails the open. With it, a failure is
+   * Opt-in failure map for a failed attempt. Without it a defect or failed first pass fails the session. With it, a failure is
    * tolerated while output is usable: `existing` reports earlier output that already serves, and a published
    * minimum also counts. The session then stays up, reports `LiveStatus.failure`, and reopens on the next
    * `requestPass`/`notify` or reconcile tick. Without usable output the open still fails.
@@ -31,7 +31,7 @@ export interface LiveStatus<W> {
   readonly state: WorkStatus<W>["state"];
   readonly pass: PassRequest | null;
   readonly followUp: PassRequest | null;
-  /** Cause of the last failed pass or open; a later successful one clears it. */
+  /** Cause of the last failed recoverable pass/open; a later successful attempt clears it. */
   readonly failure: Cause.Cause<unknown> | null;
   /** Null until output is usable. Only sessions that declare `recovery` or a `minimum` can report it. */
   readonly availability: Availability | null;
@@ -68,7 +68,7 @@ function differences(before: readonly SourceEntry[], after: readonly SourceEntry
 }
 
 /**
- * Owns scan, processing, required publication, follow-up, the periodic timer and the retry of a failed first pass.
+ * Owns scan, processing, required publication, follow-up, the periodic timer and the retry of a failed attempt.
  * The handle is usable at once: requests made before the first pass finished combine and run after it.
  */
 export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>): Effect.Effect<LiveHandle<W, E | FreshnessFailed | OutputOwnershipFailed>, never, R | Scope.Scope> {
@@ -88,6 +88,8 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
     let active: PassRequest | null = null;
     let carriedChangedPaths = new Set<string>();
     let carriedForce = false;
+    let openingChangedPaths = new Set<string>();
+    let openingForce = false;
     let failure: Cause.Cause<Failure> | null = null;
     let completion = Deferred.makeUnsafe<void, Failure>();
     const ready = Deferred.makeUnsafe<void, Failure>();
@@ -100,6 +102,10 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
       carriedChangedPaths = new Set<string>();
       carriedForce = false;
       next = { ...next, force, changedPaths };
+      if (opening || scheduler === undefined) {
+        openingForce ||= force;
+        for (const path of changedPaths) openingChangedPaths.add(path);
+      }
       const busy = !waiting && (opening || active !== null || pending !== null);
       if (state !== "working") completion = Deferred.makeUnsafe<void, Failure>();
       state = "working";
@@ -114,6 +120,18 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
       }
       return busy ? "queued" : "started";
     };
+
+    const consumeOpeningInvalidation = () => {
+      const input = { force: openingForce, changedPaths: [...openingChangedPaths] };
+      openingForce = false;
+      openingChangedPaths = new Set<string>();
+      return input;
+    };
+
+    const shouldEndAttempt = (cause: Cause.Cause<Failure>, live: Synchronization<W, E | FreshnessFailed>) => Effect.gen(function* () {
+      if (cause.reasons.some((reason) => reason._tag !== "Fail")) return true;
+      return (yield* live.status).state === "failed";
+    });
 
     const runPass = (live: Synchronization<W, E | FreshnessFailed>, requested: PassRequest) => Effect.gen(function* () {
       const entries = yield* scanSource(options.sourcePath, options.includeSource);
@@ -148,7 +166,7 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
           }
           active = null;
           failure = Exit.isFailure(exit) ? exit.cause : null;
-          if (failure !== null && (yield* live.status).state === "failed") return failure;
+          if (failure !== null && (yield* shouldEndAttempt(failure, live))) return failure;
         }
         if (state === "working") {
           state = failure === null ? (yield* live.status).state : "failed";
@@ -172,6 +190,10 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
               baseline = entries;
               return options.declare(entries, INITIAL).pipe(Effect.tap((plan) => Effect.sync(() => { declaredMinimum = (plan.minimum?.length ?? 0) > 0; })));
             },
+            beforeCommit: (live) => Effect.gen(function* () {
+              const input = consumeOpeningInvalidation();
+              if (input.force || input.changedPaths.length > 0) yield* live.submit([], input);
+            }),
           });
           // An initial traversal is not a snapshot either.
           const afterInitial = yield* scanSource(options.sourcePath, options.includeSource);
@@ -201,12 +223,13 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
         state = "failed";
         // Without usable output a served-but-empty deployment would be a lie.
         const fatal = options.recovery === undefined || availability === null;
+        const retryNow = !fatal && pending !== null;
         // Settle the flags before any Deferred: a waiter may resume inline and must see a consistent session.
         waiting = !fatal;
         if (fatal) {
           state = "stopped";
         }
-        Deferred.doneUnsafe(completion, Effect.failCause(cause));
+        if (!retryNow) Deferred.doneUnsafe(completion, Effect.failCause(cause));
 
         if (fatal) {
           Deferred.doneUnsafe(ready, Effect.failCause(cause));
@@ -214,7 +237,12 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
         }
         Deferred.doneUnsafe(ready, Effect.void);
         Deferred.doneUnsafe(settled, Effect.void);
-        yield* Queue.take(wake);
+        if (pending === null) {
+          yield* Queue.take(wake);
+        } else {
+          state = "working";
+          waiting = false;
+        }
       }
     });
 

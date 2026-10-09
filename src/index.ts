@@ -38,6 +38,8 @@ export interface InitialPass<W, E, R> extends WorkOptions<W, E, R> {
   readonly declare: (entries: readonly SourceEntry[]) => Effect.Effect<InitialPlan<W, E, R>, E, R>;
   /** Runs once, after the declared minimum finished without errors and before the remaining work starts. */
   readonly onMinimum?: Effect.Effect<void, E, R>;
+  /** Internal live hook: runs after publication and before successful freshness records are committed. */
+  readonly beforeCommit?: (synchronization: Synchronization<W, E | FreshnessFailed>) => Effect.Effect<void, E | FreshnessFailed, R>;
   readonly freshness?: FreshnessOptions<W>;
 }
 
@@ -135,12 +137,14 @@ export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>): Eff
     yield* scheduler.awaitCompletion;
     const completed = yield* scheduler.status;
     if (completed.errors.length > 0) return yield* Effect.failCause(completed.errors[0]!.cause);
-    yield* plan.publish;
-    yield* freshness.commit;
-    return {
+    const synchronization: Synchronization<W, E | FreshnessFailed> = {
       ...scheduler,
       submit: (work: readonly W[], input?: WorkInput) => Effect.suspend(() => closed ? Effect.interrupt : (input === undefined ? freshness.invalidateWork(work) : freshness.invalidate(input)).pipe(Effect.andThen(scheduler.submit(work)))),
       awaitCompletion: Effect.suspend(() => closed ? Effect.interrupt : scheduler.awaitCompletion.pipe(Effect.andThen(Effect.suspend(() => closed ? Effect.interrupt : freshness.commit)))),
     };
+    yield* plan.publish;
+    if (options.beforeCommit) yield* options.beforeCommit(synchronization);
+    yield* freshness.commit;
+    return synchronization;
   });
 }

@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Cause, Effect, Exit, Scope } from "effect";
-import { openLiveSynchronization, runInitialPass, startLiveSynchronization, type LiveSynchronization } from "../src/index.ts";
+import { acquireOutputTree, openLiveSynchronization, runInitialPass, startLiveSynchronization, type LiveHandle, type LiveSynchronization } from "../src/index.ts";
 
 const io = <A>(run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: (cause) => new Error(String(cause)) }).pipe(Effect.uninterruptible);
 
@@ -260,7 +260,7 @@ test("failed pass hints merge into an already queued follow-up", async () => {
         freshness: { describe: () => ({ sourcePaths: ["note.txt"], resultKind: "note", processingVersion: "v1", outputPaths: ["note.txt"] }) },
         declare: (_entries, request) => failNext
           ? io(async () => { entered.open(); await release.promise; throw new Error(`declare failed for ${request.changedPaths.join(",")}`); })
-          : Effect.succeed({ work: ["note.txt"], publish: Effect.void }),
+          : Effect.succeed({ work: request.changedPaths.includes("note.txt") ? ["note.txt"] : [], publish: Effect.void }),
         handle: (path: string) => io(async () => {
           await Bun.write(join(outputPath, path), await readFile(join(sourcePath, path), "utf8"));
           return [];
@@ -350,11 +350,164 @@ test("a later live pass handler defect stops admission and releases the lease", 
       const failed = yield* Effect.exit(session.awaitCompletion);
       const admission = yield* session.requestPass();
       const status = yield* session.status;
+      const release = yield* acquireOutputTree(outputPath);
+      yield* Effect.promise(release);
       return { failed: Exit.isFailure(failed), admission, state: status.state, active: status.work.active };
     })));
     // #then the session is terminal instead of keeping a failed scheduler alive
     expect(result).toEqual({ failed: true, admission: "rejected", state: "stopped", active: null });
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("later live pass defects from scan declare publish and handle end the attempt", async () => {
+  const cases = ["scan", "declare", "publish", "handle"] as const;
+  for (const defect of cases) {
+    // #given an opened live session for each pass phase that can defect
+    const root = await mkdtemp(join(tmpdir(), `sync-engine-live-${defect}-defect-`));
+    const sourcePath = join(root, "source");
+    const outputPath = join(root, "output");
+    await mkdir(sourcePath);
+    await Bun.write(join(sourcePath, "document"), "Original");
+    let fail = false;
+    try {
+      const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+        const session = yield* openLiveSynchronization({
+          sourcePath,
+          outputPath,
+          includeSource: (path) => {
+            if (fail && defect === "scan") throw new Error(`scan defect ${path}`);
+            return true;
+          },
+          declare: () => fail && defect === "declare"
+            ? Effect.die("declare defect")
+            : Effect.succeed({
+                work: ["document"],
+                publish: fail && defect === "publish" ? Effect.die("publish defect") : Effect.void,
+              }),
+          handle: (path: string) => fail && defect === "handle"
+            ? Effect.die("handle defect")
+            : io(async () => { await Bun.write(join(outputPath, path), await readFile(join(sourcePath, path), "utf8")); return []; }),
+        });
+        fail = true;
+        yield* session.requestPass({ force: true });
+        const failed = yield* Effect.exit(session.awaitCompletion);
+        const admission = yield* session.requestPass();
+        const status = yield* session.status;
+        const release = yield* acquireOutputTree(outputPath);
+        yield* Effect.promise(release);
+        return { defect, failed: Exit.isFailure(failed), admission, state: status.state };
+      })));
+      // #then every defect path stops admission and releases the attempt lease
+      expect(result).toEqual({ defect, failed: true, admission: "rejected", state: "stopped" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("notify during the first pass prevents the initial stale read from being retained", async () => {
+  // #given metadata freshness and an initial pass held after reading old bytes
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-opening-notify-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const stamp = new Date("2020-01-01T00:00:00Z");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "note.txt"), "Original");
+  await utimes(join(sourcePath, "note.txt"), stamp, stamp);
+  let holdInitial = false;
+  const activeRead = gate();
+  const releaseInitial = gate();
+  const watcherEntered = gate();
+  const options = {
+    sourcePath,
+    outputPath,
+    reconcileIntervalMs: 0,
+    freshness: { describe: () => ({ sourcePaths: ["note.txt"], resultKind: "note", processingVersion: "v1", outputPaths: ["note.txt"] }) },
+    declare: (_entries: unknown, request: { readonly kind: string }) => request.kind === "watcher"
+      ? io(async () => { watcherEntered.open(); throw new Error("stop before watcher submit"); })
+      : Effect.succeed({ work: ["note.txt"], publish: Effect.void }),
+    handle: (path: string) => io(async () => {
+      const bytes = await readFile(join(sourcePath, path), "utf8");
+      if (holdInitial) {
+        holdInitial = false;
+        activeRead.open();
+        await releaseInitial.promise;
+      }
+      await Bun.write(join(outputPath, path), bytes);
+      return [] as string[];
+    }),
+  };
+  const initialOptions = { ...options, declare: () => Effect.succeed({ work: ["note.txt"], publish: Effect.void }) };
+  try {
+    const scope = await Effect.runPromise(Scope.make());
+    holdInitial = true;
+    const session = await Effect.runPromise(startLiveSynchronization(options).pipe(Scope.provide(scope))) as LiveHandle<string, Error>;
+    await activeRead.promise;
+    // #when an equal-stamp replacement is notified before ready settles
+    await Bun.write(join(sourcePath, "note.txt"), "Changed!");
+    await utimes(join(sourcePath, "note.txt"), stamp, stamp);
+    await Effect.runPromise(session.notify(["note.txt"]));
+    releaseInitial.open();
+    await Effect.runPromise(session.ready);
+    await watcherEntered.promise;
+    await Effect.runPromise(Effect.exit(session.awaitCompletion));
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    await Effect.runPromise(runInitialPass(initialOptions));
+    // #then a fresh session replays the replacement instead of trusting the opening stale read
+    expect(await readFile(join(outputPath, "note.txt"), "utf8")).toBe("Changed!");
+  } finally {
+    releaseInitial.open();
+    watcherEntered.open();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a queued request retries immediately after a recoverable opening failure", async () => {
+  // #given a warm live session whose first attempt is held and then fails recoverably
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-opening-retry-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  await mkdir(outputPath);
+  await Bun.write(join(sourcePath, "document"), "Recovered");
+  await Bun.write(join(outputPath, "reference"), "Prior");
+  let failFirst = true;
+  let attempts = 0;
+  const entered = gate();
+  const release = gate();
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* startLiveSynchronization({
+        sourcePath,
+        outputPath,
+        reconcileIntervalMs: 0,
+        recovery: { existing: Effect.succeed(true) },
+        declare: () => Effect.succeed({ work: ["document"], publish: Effect.void }),
+        handle: (path: string) => io(async () => {
+          attempts += 1;
+          if (failFirst) {
+            entered.open();
+            await release.promise;
+            failFirst = false;
+            throw new Error("opening failed");
+          }
+          await Bun.write(join(outputPath, "reference"), await readFile(join(sourcePath, path), "utf8"));
+          return [] as string[];
+        }),
+      });
+      yield* io(() => entered.promise);
+      // #when a resync is admitted while the opening attempt is still active
+      const admission = yield* session.requestPass();
+      release.open();
+      yield* session.awaitCompletion;
+      return { admission, attempts, reference: yield* io(() => readFile(join(outputPath, "reference"), "utf8")) };
+    })));
+    // #then the pending request wakes the retry, then runs as the retained follow-up
+    expect(result).toEqual({ admission: "queued", attempts: 3, reference: "Recovered" });
+  } finally {
+    release.open();
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -586,7 +739,7 @@ test("watcher hints survive a failed pass that stops before freshness invalidati
         freshness: { describe: () => ({ sourcePaths: ["note.txt"], resultKind: "note", processingVersion: "v1", outputPaths: ["note.txt"] }) },
         declare: (_entries, request) => failDeclare
           ? Effect.fail(new Error(`declare failed for ${request.changedPaths.join(",")}`))
-          : Effect.succeed({ work: ["note.txt"], publish: Effect.void }),
+          : Effect.succeed({ work: request.changedPaths.includes("note.txt") ? ["note.txt"] : [], publish: Effect.void }),
         handle: (path: string) => io(async () => {
           await Bun.write(join(outputPath, path), await readFile(join(sourcePath, path), "utf8"));
           return [];

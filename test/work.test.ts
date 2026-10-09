@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Deferred, Effect, Exit } from "effect";
+import { Deferred, Effect, Exit, Scope } from "effect";
 import { createWorkScheduler, openSynchronization, runInitialPass } from "../src/index.ts";
 
 const io = <A>(run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: (cause) => new Error(String(cause)) }).pipe(Effect.uninterruptible);
@@ -211,6 +211,34 @@ test("a defect stops other workers from enqueueing cascades after failure", asyn
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("submit after a scheduler defect fails instead of succeeding as a no-op", async () => {
+  // #given a scheduler that has already failed with a handler defect
+  const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const scheduler = yield* createWorkScheduler<string, never, never>({
+      handle: () => Effect.die("fatal defect"),
+    });
+    yield* scheduler.submit(["first"]);
+    const completion = yield* Effect.exit(scheduler.awaitCompletion);
+    // #when later work is submitted through the same public handle
+    const submitted = yield* Effect.exit(scheduler.submit(["second"]));
+    const status = yield* scheduler.status;
+    return { completionFailed: Exit.isFailure(completion), submitFailed: Exit.isFailure(submitted), state: status.state, pending: status.pending };
+  })));
+  // #then admission still fails with the scheduler defect and no work is queued
+  expect(result).toEqual({ completionFailed: true, submitFailed: true, state: "failed", pending: 0 });
+});
+
+test("submit on a closed standalone scheduler interrupts", async () => {
+  // #given a scheduler handle whose owning scope has closed
+  const scope = await Effect.runPromise(Scope.make());
+  const scheduler = await Effect.runPromise(createWorkScheduler<string, never, never>({ handle: () => Effect.succeed([]) }).pipe(Scope.provide(scope)));
+  await Effect.runPromise(Scope.close(scope, Exit.void));
+  // #when work is submitted after close
+  const submitted = await Effect.runPromise(Effect.exit(scheduler.submit(["late"])));
+  // #then admission is interrupted instead of succeeding
+  expect(Exit.isFailure(submitted) && submitted.cause.reasons.some((reason) => reason._tag === "Interrupt")).toBe(true);
 });
 
 test("non-finite concurrency falls back to one worker", async () => {
