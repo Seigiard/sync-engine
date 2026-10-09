@@ -2,13 +2,15 @@ import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rename, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Effect, Exit, Fiber, Scope } from "effect";
+import { Cause, Effect, Exit, Fiber, Scope } from "effect";
 import { startLiveSynchronizationWithHooks, type LiveHandle } from "../src/live.ts";
 
 /*
  * Interpreter fault injection. Each cell makes one activity (the opening, a follow-up pass, or the close of a
  * failed attempt) exit in one way. Whatever the exit, `ready` and completion must settle, the session must not
- * stay busy, and the hint admitted with the work must be published exactly once.
+ * stay busy, and the hint admitted with the work must be published exactly once. Every cell also proves that its
+ * fault fired (`unfired`), and records what tells a faulty run from a fault-free one: how many openings ran and
+ * whether the dying finalizer's cause reached the failed completion.
  */
 
 type Activity = "opening" | "pass" | "close";
@@ -27,12 +29,21 @@ const settle = <A, E>(effect: Effect.Effect<A, E>) => Effect.race(
   Effect.sleep(2000).pipe(Effect.as("hung" as const)),
 );
 
+// Settles like `settle`, and also reports whether a failure carries the dying finalizer's cause.
+const settleWithCause = <A, E>(effect: Effect.Effect<A, E>) => Effect.race(
+  Effect.exit(effect).pipe(Effect.map((exit) => Exit.isSuccess(exit)
+    ? { settled: "succeeded" as const, finalizerCause: false }
+    : { settled: "failed" as const, finalizerCause: Cause.pretty(exit.cause).includes("attempt finalizer failed") })),
+  Effect.sleep(2000).pipe(Effect.as({ settled: "hung" as const, finalizerCause: false })),
+);
+
 function faultsFor(activity: Activity, kind: ExitKind): Set<Fault> {
   if (activity === "close") {
     // A close follows a failed attempt: the follow-up pass dies, then the close itself exits in `kind`.
     if (kind === "failing finalizer") return new Set(["handler dies", "finalizer dies"]);
     if (kind === "interruption") return new Set(["handler dies", "close is held"]);
-    return new Set(["handler dies"]);
+    // A successful close is what `pass × defect` already runs.
+    throw new Error(`no close cell for ${kind}`);
   }
   switch (kind) {
     case "ok": return new Set();
@@ -59,6 +70,7 @@ async function runFaultCell(activity: Activity, kind: ExitKind) {
   const published: (readonly string[])[] = [];
   const openingHeld = Promise.withResolvers<void>();
   const closeHeld = Promise.withResolvers<void>();
+  const closeHolding = Promise.withResolvers<void>();
   let initialDeclarations = 0;
   let followUpDeclarations = 0;
   const park = () => rename(sourcePath, parkedPath);
@@ -99,7 +111,9 @@ async function runFaultCell(activity: Activity, kind: ExitKind) {
     const scope = await Effect.runPromise(Scope.make());
     const session = await Effect.runPromise(startLiveSynchronizationWithHooks(options, {
       afterOpeningPublication: Effect.suspend(() => fire("trailing scan fails", activity === "opening" && initialDeclarations === 1) ? io(park).pipe(Effect.orDie) : Effect.void),
-      beforeAttemptClose: () => Effect.suspend(() => fire("close is held", true) ? Effect.promise(() => closeHeld.promise) : io(unpark).pipe(Effect.orDie)),
+      beforeAttemptClose: () => Effect.suspend(() => fire("close is held", true)
+        ? Effect.sync(() => closeHolding.resolve()).pipe(Effect.andThen(Effect.promise(() => closeHeld.promise)))
+        : io(unpark).pipe(Effect.orDie)),
     }).pipe(Scope.provide(scope))) as LiveHandle<string, Error>;
     // #when the activity under test exits as `kind`
     const result = await Effect.runPromise(Effect.gen(function* () {
@@ -110,55 +124,57 @@ async function runFaultCell(activity: Activity, kind: ExitKind) {
         yield* session.ready;
         yield* session.notify(["note.txt"]);
       }
-      if (armed.has("close is held")) {
-        // Stop the session while the failed attempt's close is held.
-        while (armed.has("handler dies")) yield* Effect.sleep(5);
-        yield* Effect.sleep(25);
+      const hintPublished = () => published.filter((paths) => paths.includes("note.txt")).length;
+      if (activity === "close" && kind === "interruption") {
+        // Stop the session once the failed attempt's close is held.
+        yield* Effect.promise(() => closeHolding.promise);
         const closing = yield* Effect.forkDetach(closeOf(scope));
-        const completion = yield* settle(session.awaitCompletion);
+        const completion = yield* settleWithCause(session.awaitCompletion);
         const closed = yield* Fiber.join(closing);
         closeHeld.resolve();
-        return { ready: yield* settle(session.ready), completion, state: (yield* session.status).state, recovered: yield* session.requestPass(), hintPublished: published.filter((paths) => paths.includes("note.txt")).length, closed };
+        return { ready: yield* settle(session.ready), completion: completion.settled, finalizerCause: completion.finalizerCause, state: (yield* session.status).state, recovered: yield* session.requestPass(), hintPublished: hintPublished(), openings: initialDeclarations, closed, unfired: [...armed] as readonly Fault[] };
       }
       const ready = yield* settle(session.ready);
-      const completion = yield* settle(session.awaitCompletion);
+      const completion = yield* settleWithCause(session.awaitCompletion);
       yield* io(unpark);
       const state = (yield* session.status).state;
       yield* session.requestPass();
       const recovered = yield* settle(session.awaitCompletion);
       const closed = yield* closeOf(scope);
-      return { ready, completion, state, recovered, hintPublished: published.filter((paths) => paths.includes("note.txt")).length, closed };
+      return { ready, completion: completion.settled, finalizerCause: completion.finalizerCause, state, recovered, hintPublished: hintPublished(), openings: initialDeclarations, closed, unfired: [...armed] as readonly Fault[] };
     }));
     return result;
   } finally {
     openingHeld.resolve();
+    closeHolding.resolve();
     closeHeld.resolve();
     await rm(root, { recursive: true, force: true });
   }
 }
 
-const recovers = { ready: "succeeded", state: "complete", recovered: "succeeded", hintPublished: 1, closed: "closed" } as const;
+// `openings` counts initial declarations: a failure that ends an attempt makes the next request reopen.
+const recovers = { ready: "succeeded", completion: "succeeded", finalizerCause: false, state: "complete", recovered: "succeeded", hintPublished: 1, openings: 1, closed: "closed", unfired: [] } as const;
 // A failed follow-up pass leaves the hint retained; the recovery request publishes it once.
-const passFails = { ready: "succeeded", completion: "failed", state: "failed", recovered: "succeeded", hintPublished: 1, closed: "closed" } as const;
+const passFails = { ready: "succeeded", completion: "failed", finalizerCause: false, state: "failed", recovered: "succeeded", hintPublished: 1, openings: 1, closed: "closed", unfired: [] } as const;
 
 test.each([
   // The hint arrives during the opening, so a failed opening is retried at once and completion still succeeds.
-  ["opening", "ok", { ...recovers, completion: "succeeded" }],
-  ["opening", "typed failure", { ...recovers, completion: "succeeded" }],
-  ["opening", "defect", { ...recovers, completion: "succeeded" }],
-  ["opening", "interruption", { ...recovers, completion: "succeeded" }],
-  ["opening", "failing finalizer", { ...recovers, completion: "succeeded" }],
-  ["opening", "failing trailing traversal", { ...recovers, completion: "succeeded" }],
-  ["pass", "ok", { ...recovers, completion: "succeeded" }],
+  ["opening", "ok", recovers],
+  ["opening", "typed failure", { ...recovers, openings: 2 }],
+  ["opening", "defect", { ...recovers, openings: 2 }],
+  ["opening", "interruption", { ...recovers, openings: 2 }],
+  ["opening", "failing finalizer", { ...recovers, openings: 2 }],
+  ["opening", "failing trailing traversal", { ...recovers, openings: 2 }],
+  ["pass", "ok", recovers],
+  // A typed failure keeps the attempt; a defect, an interruption or a dying finalizer ends it.
   ["pass", "typed failure", passFails],
-  ["pass", "defect", passFails],
-  ["pass", "interruption", passFails],
-  ["pass", "failing finalizer", passFails],
+  ["pass", "defect", { ...passFails, openings: 2 }],
+  ["pass", "interruption", { ...passFails, openings: 2 }],
+  ["pass", "failing finalizer", { ...passFails, finalizerCause: true, openings: 2 }],
   // Published and committed before the traversal failed: the failure is visible, the hint is not run again.
   ["pass", "failing trailing traversal", passFails],
-  ["close", "ok", passFails],
-  ["close", "failing finalizer", passFails],
-  ["close", "interruption", { ready: "succeeded", completion: "failed", state: "stopped", recovered: "rejected", hintPublished: 0, closed: "closed" }],
+  ["close", "failing finalizer", { ...passFails, finalizerCause: true, openings: 2 }],
+  ["close", "interruption", { ready: "succeeded", completion: "failed", finalizerCause: false, state: "stopped", recovered: "rejected", hintPublished: 0, openings: 1, closed: "closed", unfired: [] }],
 ] as const)("an interpreter activity reports one outcome whatever its exit: %s × %s", async (activity, kind, expected) => {
   // #given a recoverable session with prior output and one armed fault
   const result = await runFaultCell(activity, kind);
