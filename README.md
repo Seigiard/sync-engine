@@ -157,13 +157,14 @@ peer. `publishConfig.access` is `public` for the scoped name.
 COMPOSE_PROJECT_NAME=sync-engine docker compose -f docker-compose.test.yml run --build --rm engine-test
 COMPOSE_PROJECT_NAME=sync-engine bun test/shared-mount-check.ts
 COMPOSE_PROJECT_NAME=sync-engine docker compose -f docker-compose.test.yml down
-# 2. From a clean checkout: pack and verify identity, peer, exact inventory and byte equality
+# 2. From a clean checkout: pack and verify identity, peer, inventory and byte equality
 bun scripts/verify-pack.ts <destination>
 ```
 
 `verify-pack.ts` fails on a dirty tree, a version or peer mismatch, an unexpected file, or any packed
-file that differs from the checkout. It prints the commit, archive path, size, SHA256 and the SHA512
-integrity string a lockfile records. A release is the `npm publish` of that archive's checkout; verify
+source/README file that differs from the checkout. For `package.json`, it checks package name,
+version and peer dependencies instead of byte equality. It prints the commit, archive path, size,
+SHA256 and the SHA512 integrity string a lockfile records. A release is the `npm publish` of that archive's checkout; verify
 the registry afterwards with `npm view @seigiard/sync-engine@<version> dist.integrity` and compare it to
 the printed integrity.
 

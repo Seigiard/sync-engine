@@ -87,18 +87,19 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
     let pending: PassRequest | null = null;
     let active: PassRequest | null = null;
     let carriedChangedPaths = new Set<string>();
+    let carriedForce = false;
     let failure: Cause.Cause<Failure> | null = null;
-    let terminal = false;
     let completion = Deferred.makeUnsafe<void, Failure>();
     const ready = Deferred.makeUnsafe<void, Failure>();
     const settled = Deferred.makeUnsafe<void>();
 
     const request = (next: PassRequest): PassAdmission => {
       if (state === "stopped") return "rejected";
-      if (terminal) return "rejected";
       const changedPaths = [...new Set([...carriedChangedPaths, ...next.changedPaths])];
+      const force = carriedForce || next.force;
       carriedChangedPaths = new Set<string>();
-      next = { ...next, changedPaths };
+      carriedForce = false;
+      next = { ...next, force, changedPaths };
       const busy = !waiting && (opening || active !== null || pending !== null);
       if (state !== "working") completion = Deferred.makeUnsafe<void, Failure>();
       state = "working";
@@ -131,13 +132,23 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
     const consume = (live: Synchronization<W, E | FreshnessFailed>) => Effect.gen(function* () {
       while (true) {
         while (pending !== null) {
-          const next = pending;
+          const next = {
+            ...pending,
+            force: pending.force || carriedForce,
+            changedPaths: [...new Set([...carriedChangedPaths, ...pending.changedPaths])],
+          };
           pending = null;
+          carriedChangedPaths = new Set<string>();
+          carriedForce = false;
           active = next;
           const exit = yield* Effect.exit(runPass(live, next));
-          if (Exit.isFailure(exit)) carriedChangedPaths = new Set([...carriedChangedPaths, ...next.changedPaths]);
+          if (Exit.isFailure(exit)) {
+            carriedChangedPaths = new Set([...carriedChangedPaths, ...next.changedPaths]);
+            carriedForce ||= next.force;
+          }
           active = null;
           failure = Exit.isFailure(exit) ? exit.cause : null;
+          if (failure !== null && (yield* live.status).state === "failed") return failure;
         }
         if (state === "working") {
           state = failure === null ? (yield* live.status).state : "failed";
@@ -193,7 +204,6 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
         // Settle the flags before any Deferred: a waiter may resume inline and must see a consistent session.
         waiting = !fatal;
         if (fatal) {
-          terminal = true;
           state = "stopped";
         }
         Deferred.doneUnsafe(completion, Effect.failCause(cause));
@@ -230,8 +240,17 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
     }));
 
     return {
-      requestPass: (input = {}) => Effect.sync(() => request({ kind: "resync", force: input.force ?? false, changedPaths: [] })),
-      notify: (changedPaths) => Effect.sync(() => request({ kind: "watcher", force: false, changedPaths })),
+      requestPass: (input = {}) => Effect.gen(function* () {
+        const force = input.force ?? false;
+        const admission = request({ kind: "resync", force, changedPaths: [] });
+        if (admission !== "rejected" && force && scheduler !== undefined) yield* Effect.exit(scheduler.submit([], { force: true }));
+        return admission;
+      }),
+      notify: (changedPaths) => Effect.gen(function* () {
+        const admission = request({ kind: "watcher", force: false, changedPaths });
+        if (admission !== "rejected" && changedPaths.length > 0 && scheduler !== undefined) yield* Effect.exit(scheduler.submit([], { changedPaths }));
+        return admission;
+      }),
       awaitCompletion: Effect.suspend(() => Deferred.await(completion)),
       ready: Effect.suspend(() => Deferred.await(ready)),
       status: Effect.gen(function* () {

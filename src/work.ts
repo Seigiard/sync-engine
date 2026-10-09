@@ -85,39 +85,52 @@ export function createWorkScheduler<W, E, R>(options: WorkOptions<W, E, R>): Eff
       Deferred.doneUnsafe(completion, Effect.void);
     };
 
+    const failDefect = (cause: Cause.Cause<E>) => {
+      failure = cause;
+      state = "failed";
+      pending.length = 0;
+      Deferred.doneUnsafe(completion, Effect.failCause(cause));
+    };
+
     const consume = Effect.gen(function* () {
       while (true) {
         yield* Queue.take(wake);
         if (state === "failed" || state === "stopped") continue;
         while (state === "working" && pending.length > 0) {
-          const runnable = takeRunnable();
-          if (!runnable.found) break;
-          const work = runnable.work;
-          const activeKey = options.key?.(work);
-          active.push(work);
-          if (activeKey !== undefined) activeKeys.add(activeKey);
-          const exit = yield* Effect.exit(Effect.suspend(() => options.handle(work)));
-          removeActive(work);
-          if (activeKey !== undefined) activeKeys.delete(activeKey);
-          if (state !== "working") return;
-          if (Exit.isFailure(exit)) {
-            if (exit.cause.reasons.every((reason) => reason._tag === "Fail")) {
-              clearError(work);
-              errors.push({ work, cause: exit.cause });
-              wakeWorkers();
-              completeIfDrained();
-              continue;
+          const step = yield* Effect.exit(Effect.gen(function* () {
+            const runnable = takeRunnable();
+            if (!runnable.found) return "blocked" as const;
+            const work = runnable.work;
+            const activeKey = options.key?.(work);
+            active.push(work);
+            if (activeKey !== undefined) activeKeys.add(activeKey);
+            const exit = yield* Effect.exit(Effect.suspend(() => options.handle(work)));
+            removeActive(work);
+            if (activeKey !== undefined) activeKeys.delete(activeKey);
+            if (state !== "working") return "stopped" as const;
+            if (Exit.isFailure(exit)) {
+              if (exit.cause.reasons.every((reason) => reason._tag === "Fail")) {
+                clearError(work);
+                errors.push({ work, cause: exit.cause });
+                wakeWorkers();
+                completeIfDrained();
+                return "continue" as const;
+              }
+              failDefect(exit.cause);
+              return "failed" as const;
             }
-            failure = exit.cause;
-            state = "failed";
-            pending.length = 0;
-            Deferred.doneUnsafe(completion, Effect.failCause(exit.cause));
+            clearError(work);
+            // No yield may occur between clearing active state and enqueueing required work.
+            enqueue(exit.value);
+            wakeWorkers();
+            return "continue" as const;
+          }));
+          if (Exit.isFailure(step)) {
+            failDefect(step.cause);
             return;
           }
-          clearError(work);
-          // Required work joins pending before clearing active or reporting completion.
-          enqueue(exit.value);
-          wakeWorkers();
+          if (step.value === "blocked") break;
+          if (step.value === "failed" || step.value === "stopped") return;
         }
         completeIfDrained();
       }
@@ -133,19 +146,22 @@ export function createWorkScheduler<W, E, R>(options: WorkOptions<W, E, R>): Eff
     }));
 
     return {
-      submit: (work) => Effect.suspend(() => {
+      submit: (work) => Effect.gen(function* () {
         if (failure !== undefined) return Effect.failCause(failure);
         if (state === "stopped") return Effect.interrupt;
         if (work.length === 0) return Effect.void;
         const wasComplete = state === "complete" || state === "complete-with-errors";
         if (wasComplete) completion = Deferred.makeUnsafe<void, E>();
         state = "working";
-        enqueue(work);
+        const exit = yield* Effect.exit(Effect.sync(() => enqueue(work)));
+        if (Exit.isFailure(exit)) {
+          failDefect(exit.cause);
+          return yield* Effect.failCause(exit.cause);
+        }
         wakeWorkers();
-        return Effect.void;
       }),
       awaitCompletion: Effect.suspend(() => Deferred.await(completion)),
-      status: Effect.sync(() => ({ state, pending: pending.length, active: active[0] ?? null, errors: [...errors] })),
+      status: Effect.sync(() => ({ state, pending: pending.length, active: active.length === 0 ? null : active[0]!, errors: [...errors] })),
     };
   });
 }

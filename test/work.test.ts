@@ -200,12 +200,14 @@ test("a defect stops other workers from enqueueing cascades after failure", asyn
       return {
         failed,
         state: status.state,
+        pending: status.pending,
+        errors: status.errors.length,
         held: yield* io(() => Bun.file(join(outputPath, "held")).exists()),
         cascade: yield* io(() => Bun.file(join(outputPath, "cascade")).exists()),
       };
     })));
     // #then the active worker's returned cascade is discarded after the defect
-    expect(observation).toEqual({ failed: "failed", state: "failed", held: true, cascade: false });
+    expect(observation).toEqual({ failed: "failed", state: "failed", pending: 0, errors: 0, held: true, cascade: false });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -248,6 +250,60 @@ test("undefined is a valid work item rather than an empty-queue sentinel", async
   })));
   // #then the handler sees the item exactly once
   expect(result).toEqual({ handled: 1, state: "complete" });
+});
+
+test("status reports an active undefined work item", async () => {
+  // #given a held payload-free item
+  const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const scheduler = yield* createWorkScheduler<void, never, never>({
+      handle: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.as([] as void[])),
+    });
+    // #when undefined is active
+    yield* scheduler.submit([undefined]);
+    yield* Deferred.await(entered);
+    const active = (yield* scheduler.status).active;
+    yield* Deferred.succeed(release, undefined);
+    yield* scheduler.awaitCompletion;
+    return { hasActiveProperty: Object.hasOwn({ active }, "active"), active };
+  })));
+  // #then status preserves the payload value instead of replacing it with null
+  expect(result).toEqual({ hasActiveProperty: true, active: undefined });
+});
+
+test("key callback defects fail the scheduler instead of hanging completion", async () => {
+  // #given an application key callback that throws
+  const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const scheduler = yield* createWorkScheduler<string, never, never>({
+      key: () => { throw new Error("bad key"); },
+      handle: () => Effect.succeed([]),
+    });
+    // #when work is submitted
+    const submitted = yield* Effect.exit(scheduler.submit(["work"]));
+    const exit = yield* Effect.exit(scheduler.awaitCompletion);
+    const status = yield* scheduler.status;
+    return { submitFailed: Exit.isFailure(submitted), failed: Exit.isFailure(exit), state: status.state, pending: status.pending };
+  })));
+  // #then completion fails and pending work is cleared
+  expect(result).toEqual({ submitFailed: true, failed: true, state: "failed", pending: 0 });
+});
+
+test("failureKey callback defects fail the scheduler instead of hanging completion", async () => {
+  // #given a failure-key callback that throws while clearing a typed failure
+  const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const scheduler = yield* createWorkScheduler<string, string, never>({
+      failureKey: () => { throw new Error("bad failure key"); },
+      handle: () => Effect.fail("typed failure"),
+    });
+    // #when work reaches the typed-failure path
+    yield* scheduler.submit(["work"]);
+    const exit = yield* Effect.exit(scheduler.awaitCompletion);
+    const status = yield* scheduler.status;
+    return { failed: Exit.isFailure(exit), state: status.state, pending: status.pending, errors: status.errors.length };
+  })));
+  // #then completion fails as a scheduler defect rather than hanging
+  expect(result).toEqual({ failed: true, state: "failed", pending: 0, errors: 0 });
 });
 
 test("pending work with an active equivalent key waits while different-key work starts", async () => {

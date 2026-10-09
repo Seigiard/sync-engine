@@ -2,8 +2,8 @@ import { test, expect } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Cause, Effect, Exit } from "effect";
-import { openLiveSynchronization, startLiveSynchronization } from "../src/index.ts";
+import { Cause, Effect, Exit, Scope } from "effect";
+import { openLiveSynchronization, runInitialPass, startLiveSynchronization, type LiveSynchronization } from "../src/index.ts";
 
 const io = <A>(run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: (cause) => new Error(String(cause)) }).pipe(Effect.uninterruptible);
 
@@ -205,11 +205,15 @@ test("typed required failures still publish prior results and remain visible in 
   await Bun.write(join(sourcePath, "document"), "Original source");
   try {
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      let publishes = 0;
       const session = yield* openLiveSynchronization({
         sourcePath, outputPath,
         declare: () => Effect.succeed({
           work: ["document"],
-          publish: io(async () => Bun.write(join(outputPath, "reference"), await readFile(join(outputPath, "document"), "utf8"))),
+          publish: io(async () => {
+            publishes += 1;
+            await Bun.write(join(outputPath, "reference"), `${publishes}:${await readFile(join(outputPath, "document"), "utf8")}`);
+          }),
         }),
         handle: (path: string) => io(() => readFile(join(sourcePath, path), "utf8")).pipe(Effect.flatMap((bytes) =>
           bytes === "Broken source"
@@ -225,13 +229,190 @@ test("typed required failures still publish prior results and remain visible in 
       return {
         state: status.state,
         errors: status.work.errors.map((error) => error.work),
+        publishes,
         result: yield* io(() => readFile(join(outputPath, "document"), "utf8")),
         reference: yield* io(() => readFile(join(outputPath, "reference"), "utf8")),
       };
     })));
     // #then the pass published with visible errors and retained the prior required result
-    expect(result).toEqual({ state: "complete-with-errors", errors: ["document"], result: "Prepared: Original source", reference: "Prepared: Original source" });
+    expect(result).toEqual({ state: "complete-with-errors", errors: ["document"], publishes: 2, result: "Prepared: Original source", reference: "2:Prepared: Original source" });
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("failed pass hints merge into an already queued follow-up", async () => {
+  // #given a retained metadata result and a held pass that will fail before freshness invalidation
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-carried-pending-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const stamp = new Date("2020-01-01T00:00:00Z");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "note.txt"), "Original");
+  await utimes(join(sourcePath, "note.txt"), stamp, stamp);
+  let failNext = false;
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const entered = gate();
+      const release = gate();
+      const session = yield* openLiveSynchronization({
+        sourcePath, outputPath,
+        freshness: { describe: () => ({ sourcePaths: ["note.txt"], resultKind: "note", processingVersion: "v1", outputPaths: ["note.txt"] }) },
+        declare: (_entries, request) => failNext
+          ? io(async () => { entered.open(); await release.promise; throw new Error(`declare failed for ${request.changedPaths.join(",")}`); })
+          : Effect.succeed({ work: ["note.txt"], publish: Effect.void }),
+        handle: (path: string) => io(async () => {
+          await Bun.write(join(outputPath, path), await readFile(join(sourcePath, path), "utf8"));
+          return [];
+        }),
+      });
+      yield* io(async () => {
+        await Bun.write(join(sourcePath, "note.txt"), "Changed!");
+        await utimes(join(sourcePath, "note.txt"), stamp, stamp);
+      });
+      failNext = true;
+      yield* session.notify(["note.txt"]);
+      yield* io(() => entered.promise);
+      // #when a follow-up is already queued before the failing pass returns
+      yield* session.requestPass();
+      failNext = false;
+      release.open();
+      yield* session.awaitCompletion;
+      return yield* io(() => readFile(join(outputPath, "note.txt"), "utf8"));
+    })));
+    // #then the queued follow-up receives the failed pass hint and repairs equal-stamp output
+    expect(result).toBe("Changed!");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("failed forced pass preserves force for an already queued follow-up", async () => {
+  // #given retained work that only a forced retry will rebuild
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-carried-force-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "note.txt"), "Original");
+  let failNext = false;
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const entered = gate();
+      const release = gate();
+      const session = yield* openLiveSynchronization({
+        sourcePath, outputPath,
+        freshness: { describe: () => ({ sourcePaths: ["note.txt"], resultKind: "note", processingVersion: "v1", outputPaths: ["note.txt"] }) },
+        declare: (_entries, request) => failNext
+          ? io(async () => { entered.open(); await release.promise; throw new Error(`declare failed force=${request.force}`); })
+          : Effect.succeed({ work: request.force ? ["note.txt"] : [], publish: Effect.void }),
+        handle: (path: string) => io(async () => {
+          await Bun.write(join(outputPath, path), await readFile(join(sourcePath, path), "utf8"));
+          return [];
+        }),
+      });
+      yield* io(() => Bun.write(join(sourcePath, "note.txt"), "Forced"));
+      failNext = true;
+      yield* session.requestPass({ force: true });
+      yield* io(() => entered.promise);
+      yield* session.requestPass();
+      failNext = false;
+      release.open();
+      yield* session.awaitCompletion;
+      return yield* io(() => readFile(join(outputPath, "note.txt"), "utf8"));
+    })));
+    // #then the queued follow-up inherits force and rebuilds despite no hint
+    expect(result).toBe("Forced");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a later live pass handler defect stops admission and releases the lease", async () => {
+  // #given an opened live session over a real output tree
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-later-defect-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "document"), "Original");
+  let defect = false;
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* openLiveSynchronization({
+        sourcePath, outputPath,
+        declare: () => Effect.succeed({ work: ["document"], publish: Effect.void }),
+        handle: (path: string) => defect
+          ? Effect.die("later handler defect")
+          : io(async () => { await Bun.write(join(outputPath, path), await readFile(join(sourcePath, path), "utf8")); return []; }),
+      });
+      defect = true;
+      yield* io(() => Bun.write(join(sourcePath, "document"), "Changed"));
+      yield* session.requestPass({ force: true });
+      const failed = yield* Effect.exit(session.awaitCompletion);
+      const admission = yield* session.requestPass();
+      const status = yield* session.status;
+      return { failed: Exit.isFailure(failed), admission, state: status.state, active: status.work.active };
+    })));
+    // #then the session is terminal instead of keeping a failed scheduler alive
+    expect(result).toEqual({ failed: true, admission: "rejected", state: "stopped", active: null });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("notify during active work prevents the active stale read from being retained", async () => {
+  // #given retained metadata freshness and a force pass held after reading the old source
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-active-notify-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const stamp = new Date("2020-01-01T00:00:00Z");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "note.txt"), "Original");
+  await utimes(join(sourcePath, "note.txt"), stamp, stamp);
+  const options = {
+    sourcePath, outputPath,
+    freshness: { describe: () => ({ sourcePaths: ["note.txt"], resultKind: "note", processingVersion: "v1", outputPaths: ["note.txt"] }) },
+    declare: (_entries: unknown, request: { readonly kind: string }) => request.kind === "watcher"
+      ? io(async () => { watcherEntered.open(); throw new Error("stop before watcher submit"); })
+      : Effect.succeed({ work: ["note.txt"], publish: Effect.void }),
+    handle: (path: string) => io(async () => {
+      const bytes = await readFile(join(sourcePath, path), "utf8");
+      if (holdActive) {
+        holdActive = false;
+        activeRead.open();
+        await releaseActive.promise;
+      }
+      await Bun.write(join(outputPath, path), bytes);
+      return [] as string[];
+    }),
+  };
+  const initialOptions = {
+    ...options,
+    declare: () => Effect.succeed({ work: ["note.txt"], publish: Effect.void }),
+  };
+  let holdActive = false;
+  const activeRead = gate();
+  const releaseActive = gate();
+  const watcherEntered = gate();
+  try {
+    const scope = await Effect.runPromise(Scope.make());
+    const session = await Effect.runPromise(openLiveSynchronization(options).pipe(Scope.provide(scope))) as LiveSynchronization<string, Error>;
+    holdActive = true;
+    await Effect.runPromise(session.requestPass({ force: true }));
+    await activeRead.promise;
+    // #when an equal-stamp replacement is notified while the stale read is active
+    await Bun.write(join(sourcePath, "note.txt"), "Changed!");
+    await utimes(join(sourcePath, "note.txt"), stamp, stamp);
+    await Effect.runPromise(session.notify(["note.txt"]));
+    releaseActive.open();
+    await watcherEntered.promise;
+    await Effect.runPromise(Effect.exit(session.awaitCompletion));
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    await Effect.runPromise(runInitialPass(initialOptions));
+    // #then a fresh session replays the replacement instead of trusting the active read's stale record
+    expect(await readFile(join(outputPath, "note.txt"), "utf8")).toBe("Changed!");
+  } finally {
+    releaseActive.open();
+    watcherEntered.open();
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -337,10 +518,14 @@ test("directory removal and kind changes keep prefix invalidation", async () => 
   try {
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const handled: string[] = [];
+      const requests: string[][] = [];
       const session = yield* openLiveSynchronization({
         sourcePath, outputPath,
         freshness: { describe: (path: string) => ({ sourcePaths: [path], resultKind: "file", processingVersion: "v1", outputPaths: [`out-${path.replaceAll("/", "__")}`] }) },
-        declare: (entries) => Effect.succeed({ work: entries.filter((entry) => entry.kind === "file").map((entry) => entry.path), publish: Effect.void }),
+        declare: (entries, request) => Effect.sync(() => {
+          requests.push([...request.changedPaths]);
+          return { work: entries.filter((entry) => entry.kind === "file").map((entry) => entry.path), publish: Effect.void };
+        }),
         handle: (path: string) => io(async () => {
           handled.push(path);
           await Bun.write(join(outputPath, `out-${path.replaceAll("/", "__")}`), await readFile(join(sourcePath, path), "utf8"));
@@ -353,6 +538,7 @@ test("directory removal and kind changes keep prefix invalidation", async () => 
       yield* io(() => rm(join(sourcePath, "gone"), { recursive: true }));
       yield* session.requestPass();
       yield* session.awaitCompletion;
+      const removalHints = requests.at(-1) ?? [];
       yield* io(() => mkdir(join(sourcePath, "gone")));
       yield* io(() => Bun.write(join(sourcePath, "gone", "one.txt"), "Gone one"));
       yield* io(() => utimes(join(sourcePath, "gone", "one.txt"), stamp, stamp));
@@ -368,15 +554,16 @@ test("directory removal and kind changes keep prefix invalidation", async () => 
       yield* io(() => Bun.write(join(sourcePath, "flip", "child.txt"), "Child"));
       yield* session.requestPass();
       yield* session.awaitCompletion;
+      const fileToDirectoryHints = requests.at(-1) ?? [];
       yield* io(() => rm(join(sourcePath, "flip"), { recursive: true }));
       yield* io(() => Bun.write(join(sourcePath, "flip"), "File first"));
       yield* io(() => utimes(join(sourcePath, "flip"), old.atime, old.mtime));
       yield* session.requestPass();
       yield* session.awaitCompletion;
-      return { afterRemoval, afterKindChange: [...handled] };
+      return { afterRemoval, afterKindChange: [...handled], removalHints, fileToDirectoryHints };
     })));
     // #then removed directories and kind changes drop the old retained records
-    expect(result).toEqual({ afterRemoval: ["gone/one.txt"], afterKindChange: ["flip/child.txt", "flip"] });
+    expect(result).toEqual({ afterRemoval: ["gone/one.txt"], afterKindChange: ["flip/child.txt", "flip"], removalHints: ["gone", "gone/one.txt"], fileToDirectoryHints: ["flip", "flip/child.txt"] });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
