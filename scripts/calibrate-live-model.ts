@@ -135,6 +135,26 @@ const mutations: readonly Mutation[] = [
     search: `const cause = event.cause ?? phase.cause;`,
     replace: `const cause = phase.cause;`,
   },
+  {
+    id: "M20", name: "a fatal failed close drops its cause (round 12)", expect: "S2",
+    search: `const cause = event.cause ?? state.cause;`,
+    replace: `const cause = state.cause;`,
+  },
+  {
+    id: "M21", name: "a recoverable failed close settles completion with the old cause (round 12)", expect: "S2",
+    search: `commands: [...readyCommands(state), { tag: "settleCompletion", gen: state.ids.gen, exit: { tag: "failure", cause } }],`,
+    replace: `commands: [...readyCommands(state), { tag: "settleCompletion", gen: state.ids.gen, exit: { tag: "failure", cause: phase.cause } }],`,
+  },
+  {
+    id: "M22", name: "a fatal failed close settles ready and completion with the old cause (round 12)", expect: "S2",
+    search: `const failure: Settlement<C> = { tag: "failure", cause };`,
+    replace: `const failure: Settlement<C> = { tag: "failure", cause: state.cause };`,
+  },
+  {
+    id: "M23", name: "init starts an attempt other than the one it opens (round 12)", expect: "L1",
+    search: `commands: [{ tag: "startAttempt", attempt: 1 }],`,
+    replace: `commands: [{ tag: "startAttempt", attempt: 2 }],`,
+  },
 ];
 
 const argument = (name: string) => {

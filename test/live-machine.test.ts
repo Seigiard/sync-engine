@@ -93,9 +93,13 @@ function start(config: Config): Ghost {
     attemptsInGen: 0,
     nextToken: 0,
   };
-  if (first.commands.length !== 1 || first.commands[0]!.tag !== "startAttempt") throw new Error("init must start exactly one attempt");
-  ghost.openAttempt = 1;
-  ghost.activity = { kind: "opening", attempt: 1, usable: false, fresh: false };
+  const command = first.commands[0];
+  if (first.commands.length !== 1 || command?.tag !== "startAttempt") throw new Error("[L1] init must start exactly one attempt");
+  // The interpreter starts the attempt the command names; the reducer accepts only events of the attempt it opens.
+  const opening = first.state.tag === "live" && first.state.phase.tag === "opening" ? first.state.phase.attempt : null;
+  if (opening !== command.attempt || first.state.ids.attempt !== command.attempt) throw new Error(`[L1] init starts attempt ${command.attempt} but opens ${opening}`);
+  ghost.openAttempt = command.attempt;
+  ghost.activity = { kind: "opening", attempt: command.attempt, usable: false, fresh: false };
   ghost.attemptsInGen = 1;
   return ghost;
 }
@@ -368,7 +372,9 @@ function apply(source: Ghost, move: Move): Applied {
   } else if (!(event.tag === "attemptClosed" && event.cause !== undefined && pre.tag !== "stopped")) check(post.failure === pre.failure, "S2", `failure changed by ${event.tag}`);
   if (pre.availability !== null) check(post.availability === pre.availability, "V1", "availability changed after it was set");
   check((post.availability !== null) === ghost.usable, "V1", `availability ${post.availability} while usable output is ${ghost.usable} after ${event.tag}`);
-  if (accepted && event.tag === "attemptClosed" && event.cause !== undefined) check(post.failure === event.cause, "S2", "a failed close did not report its cause");
+  // A failed close reports its cause whether the attempt ended recoverably (closing) or fatally (halting).
+  const closesAttempt = pre.tag === "halting" || prePhase?.tag === "closing";
+  if (closesAttempt && event.tag === "attemptClosed" && event.cause !== undefined) check(post.failure === event.cause, "S2", `a failed close did not report its cause in ${phaseTag(pre)}`);
 
   // Admitted requests join the ghost after the step's own outcome bookkeeping.
   // A request admitted after stop is already an A1 violation; only live admissions join the ghost.
@@ -429,12 +435,14 @@ function apply(source: Ghost, move: Move): Applied {
         break;
       case "settleCompletion":
         check(command.gen === post.ids.gen && !ghost.currentSettled, "C1", `generation ${command.gen} settled twice or out of order`);
+        if (command.exit.tag === "failure") check(command.exit.cause === post.failure, "S2", `completion failed with ${command.exit.cause}, but the session reports ${post.failure}`);
         if (command.exit.tag === "success") check(ghost.held.length === 0, "P3", `completion succeeded while ${ghost.held.map((req) => req.token ?? "a trigger").join(", ")} was held`);
         ghost.currentSettled = true;
         break;
       case "settleReady":
         check(ghost.readySettled === 0, "R1", "ready settled twice");
         if (command.exit.tag === "failure") check(event.tag === "attemptClosed", "R1", `ready failed on ${event.tag} before the lease was released`);
+        if (command.exit.tag === "failure") check(command.exit.cause === post.failure, "S2", `ready failed with ${command.exit.cause}, but the session reports ${post.failure}`);
         ghost.readySettled += 1;
         break;
     }
