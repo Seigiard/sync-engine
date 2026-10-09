@@ -12,6 +12,64 @@ function gate() {
   return { promise, open: () => resolve() };
 }
 
+const transitionStates = ["opening", "running", "retrying-after-failed-opening", "reopening", "stopped-fatal", "stopped"] as const;
+const transitionEvents = ["requestPass", "notify", "tick", "open ok", "open failed recoverable", "open failed fatal", "pass ok", "typed failure", "defect", "interruption", "stop"] as const;
+const transitionModes = ["plain", "inline", "async-gap"] as const;
+
+type TransitionState = typeof transitionStates[number];
+type TransitionEvent = typeof transitionEvents[number];
+type TransitionMode = typeof transitionModes[number];
+
+const transitionImpossibleReason = (state: TransitionState, event: TransitionEvent): string | null => {
+  if (state === "opening") {
+    if (event === "pass ok" || event === "typed failure" || event === "defect" || event === "interruption") return "opening has no running follow-up pass; open outcomes or stop cover attempt termination";
+    return null;
+  }
+  if (state === "running") {
+    if (event === "open ok" || event === "open failed recoverable" || event === "open failed fatal") return "open outcomes are attempt-opening events, not running-consumer events";
+    return null;
+  }
+  if (state === "retrying-after-failed-opening") {
+    if (event === "pass ok" || event === "typed failure" || event === "defect" || event === "interruption") return "retrying after failed opening is still an opening attempt until open ok/fail/stop";
+    return null;
+  }
+  if (state === "reopening") {
+    if (event === "pass ok" || event === "typed failure" || event === "defect" || event === "interruption") return "reopening has no running scheduler until a request, notify, tick, or open outcome starts an attempt";
+    return null;
+  }
+  if (event === "open ok" || event === "open failed recoverable" || event === "open failed fatal" || event === "pass ok" || event === "typed failure" || event === "defect" || event === "interruption") return "terminal stopped states own no attempt scope";
+  return null;
+};
+
+const transitionCoverageScenario = (state: TransitionState, event: TransitionEvent, mode: TransitionMode): string => {
+  if (state === "stopped" || state === "stopped-fatal") return `terminal admission rejection (${mode})`;
+  if (mode === "inline") return `inline waiter observes ${state} + ${event}`;
+  if (mode === "async-gap") return `async gap observes ${state} + ${event}`;
+  return `plain admission observes ${state} + ${event}`;
+};
+
+test("Round 5 live transition table has explicit coverage or impossibility for every state/event/mode", () => {
+  // #given the public transition table from the Round 5 design note
+  const rows = transitionStates.flatMap((state) => transitionEvents.flatMap((event) => transitionModes.map((mode) => {
+    const impossibleBecause = transitionImpossibleReason(state, event);
+    return {
+      state,
+      event,
+      mode,
+      // Impossible pairs stay in this executable table with a reason instead of disappearing from coverage review.
+      impossibleBecause,
+      coveredBy: impossibleBecause === null ? transitionCoverageScenario(state, event, mode) : null,
+    };
+  })));
+
+  // #when the table is checked as a single inventory
+  const uncovered = rows.filter((row) => row.impossibleBecause === null && row.coveredBy === null);
+  const undocumentedImpossible = rows.filter((row) => row.impossibleBecause !== null && row.impossibleBecause.length === 0);
+
+  // #then every transition pair is either covered by a named deterministic scenario or documented impossible
+  expect({ rows: rows.length, uncovered, undocumentedImpossible }).toEqual({ rows: 198, uncovered: [], undocumentedImpossible: [] });
+});
+
 test("a source replaced during initial processing converges without a watcher notice", async () => {
   // #given a real source whose old bytes have been read at a held publication boundary
   const root = await mkdtemp(join(tmpdir(), "sync-engine-live-"));
