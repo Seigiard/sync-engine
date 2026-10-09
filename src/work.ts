@@ -43,14 +43,23 @@ export function createWorkScheduler<W, E, R>(options: WorkOptions<W, E, R>): Eff
     let completion = Deferred.makeUnsafe<void, E>();
     Deferred.doneUnsafe(completion, Effect.void);
 
+    // A repeated request reflects later changes: an earlier equivalent pending item is dropped and the latest one
+    // queues behind intervening work. Each key is evaluated once, so a full plan costs linear time.
     const enqueue = (work: readonly W[]) => {
-      for (const item of work) {
-        const key = options.key?.(item);
-        const previous = key === undefined ? -1 : pending.findIndex((candidate) => options.key?.(candidate) === key);
-        // A repeated request reflects later changes: refresh after intervening work.
-        if (previous !== -1) pending.splice(previous, 1);
-        pending.push(item);
+      const keys = work.map((item) => options.key?.(item));
+      const latest = new Map<string, number>();
+      keys.forEach((key, index) => { if (key !== undefined) latest.set(key, index); });
+      if (latest.size > 0) {
+        const kept = pending.filter((item) => {
+          const key = options.key?.(item);
+          return key === undefined || !latest.has(key);
+        });
+        pending.splice(0, pending.length, ...kept);
       }
+      work.forEach((item, index) => {
+        const key = keys[index];
+        if (key === undefined || latest.get(key) === index) pending.push(item);
+      });
     };
 
     const clearError = (work: W) => {

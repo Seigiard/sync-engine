@@ -488,3 +488,23 @@ test("a failed source retains its result while independent work finishes with an
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("submitting keyed work evaluates each item's key once", async () => {
+  // #given a scheduler whose single worker is held, so submitted work stays pending
+  const items = Array.from({ length: 2000 }, (_, index) => `item-${index}`);
+  let keyCalls = 0;
+  const release = Promise.withResolvers<void>();
+  const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const scheduler = yield* createWorkScheduler({
+      key: (work: string) => { keyCalls += 1; return work; },
+      handle: () => Effect.promise(() => release.promise).pipe(Effect.as([] as string[])),
+    });
+    // #when a full plan of distinct keyed items is submitted at once
+    yield* scheduler.submit(items);
+    const calls = keyCalls;
+    release.resolve();
+    return { calls, pending: (yield* scheduler.status).pending };
+  })));
+  // #then the cost is one key evaluation per submitted item, not one per pending pair
+  expect(result).toEqual({ calls: 2000, pending: 2000 });
+});
