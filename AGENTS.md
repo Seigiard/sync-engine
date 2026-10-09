@@ -8,7 +8,7 @@ This file provides guidance to coding agents working with code in this repositor
 
 ## Commands
 
-The output lease spawns Linux `flock` (util-linux), which macOS lacks. Run the suite in Docker:
+The output lease spawns Linux `flock` (util-linux), which macOS lacks. Without it, `bun test` stops at the `test/flock-guard.ts` preload and prints the Docker commands. Run the suite in Docker; CI (`.github/workflows/test.yml`) runs the same command on every PR and push to `main`:
 
 ```sh
 docker compose -f docker-compose.test.yml run --rm --build engine-test                      # bun run check
@@ -16,9 +16,9 @@ docker compose -f docker-compose.test.yml run --rm engine-test bun test test/wor
 docker compose -f docker-compose.test.yml run --rm engine-test bun test test/live.test.ts -t "<name>"
 ```
 
-Compose bind-mounts `src`, `test`, `scripts` and `tsconfig.json`; pass `--build` after a change to `package.json` or `bun.lock`.
+Compose bind-mounts `src`, `test`, `scripts`, `tsconfig.json` and `bunfig.toml`; pass `--build` after a change to `package.json` or `bun.lock`.
 
-Host-safe, after `bun install`: `bun run lint`, `bun run typecheck`, `bun test test/live-machine.test.ts`. Every other test file opens a lease.
+Host-safe, after `bun install`: `bun run lint`, `bun run typecheck`. The model check is the one test free of `flock`, and the calibration baseline runs it on the host: `bun scripts/calibrate-live-model.ts --only none`.
 
 Manual checks:
 
