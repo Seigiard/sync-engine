@@ -771,8 +771,9 @@ async function runPayloadScenario(scenario: PayloadScenario) {
   const retryEntered = gate();
   const releaseRetry = gate();
   let attempts = 0;
+  let openings = 0;
   const shouldFail = (attempt: number) => {
-    if (scenario === "opening-fail-retry-ok") return attempt === 1;
+    if (scenario === "opening-fail-retry-ok" || scenario === "retry-ok" || scenario === "reopen-ok") return attempt === 1;
     if (scenario === "opening-fail-retry-fail-reopen-ok") return attempt === 1 || attempt === 2;
     if (scenario === "retry-fail-reopen-ok") return attempt === 1 || attempt === 2;
     if (scenario === "reopen-fail-later-ok") return attempt === 1 || attempt === 2;
@@ -786,7 +787,8 @@ async function runPayloadScenario(scenario: PayloadScenario) {
         reconcileIntervalMs: 0,
         recovery: { existing: Effect.succeed(true) },
         declare: (_entries, request) => Effect.sync(() => {
-          if (request.kind !== "initial") followUps.push({ kind: request.kind, force: request.force, changedPaths: [...request.changedPaths] });
+          if (request.kind === "initial") openings += 1;
+          else followUps.push({ kind: request.kind, force: request.force, changedPaths: [...request.changedPaths] });
           return { work: ["note.txt"], publish: Effect.void };
         }),
         handle: (path: string) => {
@@ -852,7 +854,7 @@ async function runPayloadScenario(scenario: PayloadScenario) {
     })));
     const payloadBearing = result.followUps.filter((request) => request.force || request.changedPaths.length > 0);
     const matching = payloadBearing.filter((request) => request.force && request.changedPaths.length === 1 && request.changedPaths[0] === "note.txt");
-    return { attempts: result.attempts, followUps: result.followUps, payloadBearing, matching };
+    return { attempts: result.attempts, openings, followUps: result.followUps, payloadBearing, matching };
   } finally {
     release.open();
     releaseRetry.open();
@@ -861,19 +863,21 @@ async function runPayloadScenario(scenario: PayloadScenario) {
 }
 
 test.each([
-  ["during first opening -> open ok", "opening-ok"],
-  ["during first opening -> open fail -> retry ok", "opening-fail-retry-ok"],
-  ["during first opening -> open fail -> retry fail -> reopen ok", "opening-fail-retry-fail-reopen-ok"],
-  ["during the retry attempt -> retry ok", "retry-ok"],
-  ["during the retry attempt -> retry fail -> reopen ok", "retry-fail-reopen-ok"],
-  ["during reopen -> open ok", "reopen-ok"],
-  ["during reopen -> open fail -> later open ok", "reopen-fail-later-ok"],
-  ["while running -> recoverable defect -> retry ok", "running-recoverable-defect"],
-] as const)("request payload model preserves force and hints exactly once: %s", async (_label, scenario) => {
+  // `openings` counts initial declarations, so each label's retry or reopen is proven to have happened.
+  ["during first opening -> open ok", "opening-ok", 1],
+  ["during first opening -> open fail -> retry ok", "opening-fail-retry-ok", 2],
+  ["during first opening -> open fail -> retry fail -> reopen ok", "opening-fail-retry-fail-reopen-ok", 3],
+  ["during the retry attempt -> retry ok", "retry-ok", 2],
+  ["during the retry attempt -> retry fail -> reopen ok", "retry-fail-reopen-ok", 3],
+  ["during reopen -> open ok", "reopen-ok", 2],
+  ["during reopen -> open fail -> later open ok", "reopen-fail-later-ok", 3],
+  ["while running -> recoverable defect -> retry ok", "running-recoverable-defect", 2],
+] as const)("request payload model preserves force and hints exactly once: %s", async (_label, scenario, openings) => {
   // #given a table cell that admits a forced request and a source hint at a distinct live state
   const result = await runPayloadScenario(scenario);
-  // #then the next successful follow-up declare receives their union exactly once
-  expect({ matching: result.matching, payloadBearing: result.payloadBearing }).toEqual({
+  // #then the cell reached its state, and the next successful follow-up declare receives their union exactly once
+  expect({ openings: result.openings, matching: result.matching, payloadBearing: result.payloadBearing }).toEqual({
+    openings,
     matching: [{ kind: "resync", force: true, changedPaths: ["note.txt"] }],
     payloadBearing: [{ kind: "resync", force: true, changedPaths: ["note.txt"] }],
   });
