@@ -104,7 +104,7 @@ export function openFreshness<W, E, R>(
       for (const output of descriptor.outputPaths) {
         try { await lstat(checkedPath(options.outputPath, output)); }
         catch (cause) {
-          if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") return false;
+          if (isAbsentPath(cause)) return false;
           throw cause;
         }
       }

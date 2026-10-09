@@ -349,6 +349,42 @@ test("freshness treats a regular-file ancestor as confirmed absence for cleanup 
   }
 });
 
+test("freshness treats ENOTDIR under an output ancestor as a missing declared output", async () => {
+  // #given a retained result whose declared output is later obstructed by a regular-file ancestor
+  const root = await mkdtemp(join(tmpdir(), "sync-freshness-output-enotdir-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const statePath = join(root, "state");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "note.txt"), "Current source");
+  try {
+    let handled = 0;
+    const freshness = await Effect.runPromise(openFreshness({
+      sourcePath,
+      outputPath,
+      freshness: { describe: () => ({ sourcePaths: ["note.txt"], resultKind: "note", processingVersion: "v1", outputPaths: ["folder/result"] }) },
+      handle: () => io(async () => {
+        handled += 1;
+        await rm(join(outputPath, "folder"), { recursive: true, force: true });
+        await mkdir(join(outputPath, "folder"), { recursive: true });
+        await Bun.write(join(outputPath, "folder", "result"), `Published ${handled}`);
+        return [] as string[];
+      }),
+    }, statePath));
+    await Effect.runPromise(freshness.handle("note"));
+    await Effect.runPromise(freshness.commit);
+    await rm(join(outputPath, "folder"), { recursive: true, force: true });
+    await Bun.write(join(outputPath, "folder"), "not a directory");
+    // #when the retained source stamp matches but the output lstat gets ENOTDIR
+    const result = await Effect.runPromise(freshness.handle("note").pipe(Effect.as("handled"), Effect.catchTag("FreshnessFailed", () => Effect.succeed("freshness failed"))));
+    // #then freshness treats the output as absent and lets the handler restore it
+    const output = await Bun.file(join(outputPath, "folder", "result")).exists() ? await readFile(join(outputPath, "folder", "result"), "utf8") : "missing";
+    expect({ result, handled, output }).toEqual({ result: "handled", handled: 2, output: "Published 2" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a closed synchronization handle cannot rewrite retained freshness", async () => {
   // #given a scoped session that recorded freshness in an explicit state directory
   const { root, options } = await textTree();

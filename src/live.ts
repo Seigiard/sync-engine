@@ -90,6 +90,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
   type MachineState = "opening" | "running" | "retrying-after-failed-opening" | "reopening" | "stopped-fatal" | "stopped";
 
   return Effect.gen(function* () {
+    type RequestSlot = "pending" | "retry" | "reopen" | "carried" | "opening";
     let availability: Availability | null = options.recovery !== undefined && (yield* options.recovery.existing) ? "prior-output" : null;
     let baseline: readonly SourceEntry[] = [];
     let scheduler: Synchronization<W, E | FreshnessFailed> | undefined;
@@ -98,14 +99,8 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
     let machine: MachineState = "opening";
     let declaredMinimum = false;
     let state: LiveStatus<W>["state"] = "working";
-    let pending: PassRequest | null = null;
-    let retryAfterFailedOpening: PassRequest | null = null;
-    let reopenTrigger: PassRequest | null = null;
     let active: PassRequest | null = null;
-    let carriedChangedPaths = new Set<string>();
-    let carriedForce = false;
-    let openingChangedPaths = new Set<string>();
-    let openingForce = false;
+    const held: Record<RequestSlot, PassRequest | null> = { pending: null, retry: null, reopen: null, carried: null, opening: null };
     let failure: Cause.Cause<Failure> | null = null;
     let completion = Deferred.makeUnsafe<void, Failure>();
     const ready = Deferred.makeUnsafe<void, Failure>();
@@ -117,8 +112,18 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
       changedPaths: [...new Set([...left.changedPaths, ...right.changedPaths])],
     });
 
+    const addHeld = (slot: RequestSlot, next: PassRequest) => {
+      held[slot] = held[slot] === null ? next : combine(held[slot], next);
+    };
+
+    const takeHeld = (slot: RequestSlot) => {
+      const next = held[slot];
+      held[slot] = null;
+      return next;
+    };
+
     const mergePending = (next: PassRequest) => {
-      pending = pending === null ? next : combine(pending, next);
+      addHeld("pending", next);
     };
 
     const invalidateThrough = (target: Synchronization<W, E | FreshnessFailed> | undefined, next: PassRequest) => Effect.gen(function* () {
@@ -134,34 +139,28 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
     };
 
     const clearQueued = () => {
-      pending = null;
-      retryAfterFailedOpening = null;
-      reopenTrigger = null;
-      carriedChangedPaths = new Set<string>();
-      carriedForce = false;
-      openingChangedPaths = new Set<string>();
-      openingForce = false;
+      held.pending = null;
+      held.retry = null;
+      held.reopen = null;
+      held.carried = null;
+      held.opening = null;
     };
 
     const isStopped = () => state === "stopped";
 
     const request = (next: PassRequest): Effect.Effect<PassAdmission> => Effect.gen(function* () {
       if (isStopped()) return "rejected";
-      const changedPaths = [...new Set([...carriedChangedPaths, ...next.changedPaths])];
-      const force = carriedForce || next.force;
-      carriedChangedPaths = new Set<string>();
-      carriedForce = false;
-      next = { ...next, force, changedPaths };
+      const carried = takeHeld("carried");
+      if (carried !== null) next = combine(carried, next);
       const inOpeningWindow = machine === "opening" || machine === "retrying-after-failed-opening" || openingScheduler !== undefined;
       const invalidationTarget = inOpeningWindow ? openingScheduler ?? scheduler : scheduler;
       if (inOpeningWindow) {
-        openingForce ||= force;
-        for (const path of changedPaths) openingChangedPaths.add(path);
+        addHeld("opening", next);
       }
       yield* invalidateThrough(invalidationTarget, next);
       yield* (internal.afterRequestInvalidation ?? Effect.void);
       if (isStopped()) return "rejected";
-      const busy = (machine === "opening" || machine === "retrying-after-failed-opening" || active !== null || pending !== null) && machine !== "reopening";
+      const busy = (machine === "opening" || machine === "retrying-after-failed-opening" || active !== null || held.pending !== null) && machine !== "reopening";
       startWorking();
       mergePending(next);
       if (!busy) {
@@ -172,10 +171,8 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
     });
 
     const consumeOpeningInvalidation = () => {
-      const input = { force: openingForce, changedPaths: [...openingChangedPaths] };
-      openingForce = false;
-      openingChangedPaths = new Set<string>();
-      return input;
+      const input = takeHeld("opening");
+      return input === null ? { force: false, changedPaths: [] } : { force: input.force, changedPaths: input.changedPaths };
     };
 
     const shouldEndAttempt = (cause: Cause.Cause<Failure>, live: Synchronization<W, E | FreshnessFailed>) => Effect.gen(function* () {
@@ -200,20 +197,14 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
 
     const consume = (live: InternalSynchronization<W, E | FreshnessFailed>) => Effect.gen(function* () {
       while (true) {
-        while (pending !== null) {
-          const next = {
-            ...pending,
-            force: pending.force || carriedForce,
-            changedPaths: [...new Set([...carriedChangedPaths, ...pending.changedPaths])],
-          };
-          pending = null;
-          carriedChangedPaths = new Set<string>();
-          carriedForce = false;
+        while (held.pending !== null) {
+          const pending = takeHeld("pending")!;
+          const carried = takeHeld("carried");
+          const next = carried === null ? pending : combine(carried, pending);
           active = next;
           const exit = yield* Effect.exit(runPass(live, next));
           if (Exit.isFailure(exit)) {
-            carriedChangedPaths = new Set([...carriedChangedPaths, ...next.changedPaths]);
-            carriedForce ||= next.force;
+            addHeld("carried", next);
           }
           active = null;
           failure = Exit.isFailure(exit) ? exit.cause : null;
@@ -262,14 +253,10 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
         machine = "running";
         state = "working";
         failure = null;
-        if (retryAfterFailedOpening !== null) {
-          mergePending(retryAfterFailedOpening);
-          retryAfterFailedOpening = null;
-        }
-        if (reopenTrigger !== null) {
-          mergePending(reopenTrigger);
-          reopenTrigger = null;
-        }
+        const retry = takeHeld("retry");
+        if (retry !== null) mergePending(retry);
+        const reopen = takeHeld("reopen");
+        if (reopen !== null) mergePending(reopen);
         const initialChanges = differences(baseline, opened.value.afterInitial);
         if (initialChanges.length > 0) mergePending({ kind: "watcher", force: false, changedPaths: initialChanges });
         consumeOpeningInvalidation();
@@ -283,12 +270,12 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
 
     const supervise = Effect.gen(function* () {
       while (true) {
-        const attemptWasOneShotRetry = retryAfterFailedOpening !== null;
-        if (machine === "reopening" && retryAfterFailedOpening === null && pending !== null) {
-          reopenTrigger = reopenTrigger === null ? pending : combine(reopenTrigger, pending);
-          pending = null;
+        const attemptWasOneShotRetry = held.retry !== null;
+        if (machine === "reopening" && held.retry === null && held.pending !== null) {
+          const pending = takeHeld("pending")!;
+          addHeld("reopen", pending);
         }
-        machine = retryAfterFailedOpening === null ? "opening" : "retrying-after-failed-opening";
+        machine = held.retry === null ? "opening" : "retrying-after-failed-opening";
         const attemptExit = yield* Effect.exit(attempt);
         const cause = Exit.isFailure(attemptExit) ? attemptExit.cause as Cause.Cause<Failure> : attemptExit.value;
         scheduler = undefined;
@@ -297,8 +284,8 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
         state = "failed";
         // Without usable output a served-but-empty deployment would be a lie.
         const fatal = options.recovery === undefined || availability === null;
-        const retryNow = !fatal && retryAfterFailedOpening === null && pending !== null;
-        const wakeNewerPending = !fatal && attemptWasOneShotRetry && pending !== null;
+        const retryNow = !fatal && held.retry === null && held.pending !== null;
+        const wakeNewerPending = !fatal && attemptWasOneShotRetry && held.pending !== null;
         // Settle the flags before any Deferred: a waiter may resume inline and must see a consistent session.
         if (fatal) {
           machine = "stopped-fatal";
@@ -306,17 +293,17 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
           clearQueued();
         }
         if (retryNow) {
-          retryAfterFailedOpening = pending;
-          pending = null;
+          const pending = takeHeld("pending")!;
+          addHeld("retry", pending);
           machine = "retrying-after-failed-opening";
           state = "working";
         } else {
-          retryAfterFailedOpening = null;
+          const retry = takeHeld("retry");
+          if (retry !== null) addHeld("reopen", retry);
           if (!fatal) machine = "reopening";
           drainWakeUnsafe();
           if (wakeNewerPending) {
             state = "working";
-            Queue.offerUnsafe(wake, undefined);
           } else {
             Deferred.doneUnsafe(completion, Effect.failCause(cause));
           }
@@ -327,7 +314,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
           return;
         }
         Deferred.doneUnsafe(ready, Effect.void);
-        Deferred.doneUnsafe(settled, Effect.void);
+        if (!retryNow) Deferred.doneUnsafe(settled, Effect.void);
         if (!retryNow && !wakeNewerPending) {
           yield* Queue.take(wake);
         }
@@ -372,7 +359,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
         const work: WorkStatus<W> = scheduler !== undefined
           ? yield* scheduler.status
           : { state: state === "stopped" ? "stopped" : machine === "opening" || machine === "retrying-after-failed-opening" ? "working" : "failed", pending: 0, active: null, errors: [] };
-        return { state, pass: (machine === "opening" || machine === "retrying-after-failed-opening") && state !== "stopped" ? INITIAL : active, followUp: pending ?? retryAfterFailedOpening ?? reopenTrigger, failure, availability, work };
+        return { state, pass: (machine === "opening" || machine === "retrying-after-failed-opening") && state !== "stopped" ? INITIAL : active, followUp: held.pending ?? held.retry ?? held.reopen, failure, availability, work };
       }),
     };
   });
