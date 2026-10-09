@@ -6,5 +6,5 @@ RUN bun install --frozen-lockfile
 COPY src ./src
 COPY test ./test
 COPY scripts ./scripts
-COPY tsconfig.json ./
+COPY tsconfig.json bunfig.toml ./
 CMD ["bun", "run", "check"]

@@ -6,3 +6,4 @@ services:
       - ./test:/app/test:ro
       - ./scripts:/app/scripts:ro
       - ./tsconfig.json:/app/tsconfig.json:ro
+      - ./bunfig.toml:/app/bunfig.toml:ro
