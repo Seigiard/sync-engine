@@ -198,6 +198,8 @@ The returned session exposes:
 - `requestPass({force})`: start a pass or combine into the pending follow-up.
 - `awaitCompletion`: await admitted scans, processing, publication and follow-ups.
 - `status`: observe the active pass, pending request and work completion separately.
+  `followUp` is a pass that is scheduled to run. Data retained from a failed pass or
+  attempt is not scheduled; it joins the next request and is not shown as `followUp`.
 
 A pass remains active until required work and final publication finish. Typed
 required-work failures in a later pass produce `complete-with-errors`; final
@@ -210,8 +212,10 @@ size, mtime, kind and membership changes and requests repair before completion.
 This includes the initial pass. Stable detectable sources converge after successful
 processing; traversal does not provide a filesystem snapshot.
 
-`reconcileIntervalMs` enables the scoped timer; zero disables it. Scope closure
-stops the timer and pass consumer before the work scheduler releases its lease.
+`reconcileIntervalMs` enables the scoped timer; zero disables it. A tick acts only
+while the session is idle (finished, or failed and waiting); while a pass or attempt
+runs, the tick is dropped, because the post-processing traversal already covers it.
+Scope closure stops the timer and pass consumer before the work scheduler releases its lease.
 
 ## Attempt failure map and retry
 
@@ -226,14 +230,18 @@ output that already serves (read once before the first pass), and a published `m
 too. A completed first publication also counts as usable output. `status.availability` reports
 `"prior-output"`, `"minimum-publication"` or `null`; `"minimum-publication"` means this session has
 published usable output, either minimum or full first publication. A tolerated failure resolves `ready`,
-sets `status.failure` and `state: "failed"`, releases the lease and waits unless a request was already
-queued during the failed attempt. In that case it performs one immediate retry in `state: "working"`;
-if that retry also fails, completion fails and the session waits for a fresh request or tick, unless a
-request was accepted during the retry; that request keeps completion outstanding and reopens the session at once. The next
-`requestPass`/`notify` (reports `started`) or reconcile tick reopens the session in the same scope: a full first pass again, then any retained request. A disabled timer
+sets `status.failure` and releases the lease. One rule then decides what follows: if a request was
+admitted during the failed attempt, another attempt starts at once in `state: "working"` and completion
+stays outstanding; otherwise completion fails and the session waits in `state: "failed"`. The request
+that started an attempt does not count, so a failure without new requests never repeats on its own.
+Requests admitted while the failed attempt closes report `queued` and count as admitted during it.
+The next `requestPass`/`notify` (reports `started`) or reconcile tick reopens a waiting session in the
+same scope: a full first pass again, then every retained request. Force and hints retained from failed
+attempts also invalidate freshness before that opening records anything. A disabled timer
 (`reconcileIntervalMs: 0`) leaves only requests as retry triggers. Without usable output `ready` fails
-for the first pass, or a later attempt stops admission. This is the one owner of retry and reconcile
-scheduling; applications keep no timer of their own.
+for the first pass, or a later attempt stops admission. Admission closes as soon as such a failure is
+detected (`state: "stopped"`); `ready` and completion fail only after the attempt has released the output
+lease. This is the one owner of retry and reconcile scheduling; applications keep no timer of their own.
 
 ## Cooperative shutdown and restart
 
