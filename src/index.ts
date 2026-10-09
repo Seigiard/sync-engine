@@ -98,6 +98,7 @@ export function runInitialPass<W, E, R>(options: InitialPass<W, E, R>): Effect.E
 }
 
 /** Completes initial publication, then keeps the lease and scheduler in the caller's scope. */
+export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>): Effect.Effect<Synchronization<W, E | FreshnessFailed>, E | FreshnessFailed | ScanFailed | OutputOwnershipFailed, R | Scope.Scope>;
 export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>, internal?: OpenSynchronizationInternal<W, E, R>): Effect.Effect<Synchronization<W, E | FreshnessFailed>, E | FreshnessFailed | ScanFailed | OutputOwnershipFailed, R | Scope.Scope> {
   return Effect.gen(function* () {
     // Validate before creating output directories, including aliases through existing symlinks.

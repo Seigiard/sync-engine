@@ -27,6 +27,7 @@ export class FreshnessFailed extends Data.TaggedError("FreshnessFailed")<{
 }> {}
 
 const io = <A>(run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: (cause) => new FreshnessFailed({ cause }) }).pipe(Effect.uninterruptible);
+const isAbsentPath = (cause: unknown) => cause instanceof Error && "code" in cause && (cause.code === "ENOENT" || cause.code === "ENOTDIR");
 
 function checkedPath(root: string, path: string) {
   const normalized = normalize(path);
@@ -89,7 +90,7 @@ export function openFreshness<W, E, R>(
         catch (cause) {
           // A vanished source differs from a prior present source. If a handler confirms absence successfully,
           // the absent stamp can be retained until the source returns.
-          if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") { sources.push([source, null, null, null]); continue; }
+          if (isAbsentPath(cause)) { sources.push([source, null, null, null]); continue; }
           throw cause;
         }
         if (!info.isFile() && !info.isDirectory()) throw new Error(`Unsupported freshness source: ${source}`);

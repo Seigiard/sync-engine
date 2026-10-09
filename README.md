@@ -76,8 +76,8 @@ a shared output mount alone does not share a sibling on another filesystem.
 
 `observeSourcePath(sourcePath, relativePath, fs?)` returns present or confirmed
 absence. Missing or unreadable source roots fail with `SourceObservationFailed`.
-Absent children require a successful parent read and a valid root; symlink paths
-are excluded from source authority. `readSourceDirectory` preserves read errors.
+Absent children require a successful parent read, or a regular-file ancestor,
+and a valid root; symlink paths are excluded from source authority. `readSourceDirectory` preserves read errors.
 The optional `SourceFileSystem` is an external read-only fault-injection boundary.
 
 `removeAssociatedOutputs({ sourcePath, outputPath, statePath?, sourceRelativePath,
@@ -228,7 +228,8 @@ too. A completed first publication also counts as usable output. `status.availab
 published usable output, either minimum or full first publication. A tolerated failure resolves `ready`,
 sets `status.failure` and `state: "failed"`, releases the lease and waits unless a request was already
 queued during the failed attempt. In that case it performs one immediate retry in `state: "working"`;
-if that retry also fails, completion fails and the session waits for a fresh request or tick. The next
+if that retry also fails, completion fails and the session waits for a fresh request or tick, unless a
+request was accepted during the retry; that request keeps completion outstanding and reopens the session at once. The next
 `requestPass`/`notify` (reports `started`) or reconcile tick reopens the session in the same scope: a full first pass again, then any retained request. A disabled timer
 (`reconcileIntervalMs: 0`) leaves only requests as retry triggers. Without usable output `ready` fails
 for the first pass, or a later attempt stops admission. This is the one owner of retry and reconcile

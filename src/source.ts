@@ -55,6 +55,10 @@ export function observeSourcePath(sourcePath: string, path: string, fs: SourceFi
       const root = resolve(sourcePath);
       const rootInfo = await fs.lstat(root);
       if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new Error("Source root must be a directory");
+      const confirmRoot = async () => {
+        const confirmedRoot = await fs.lstat(root);
+        if (!confirmedRoot.isDirectory() || confirmedRoot.isSymbolicLink()) throw new Error("Source root is unavailable");
+      };
       const components = relative(root, target).split(sep).filter(Boolean);
       let current = root;
       let info = rootInfo;
@@ -67,17 +71,14 @@ export function observeSourcePath(sourcePath: string, path: string, fs: SourceFi
           if (!isMissing(cause)) throw cause;
           // A failed/incomplete directory read is not proof of removal.
           if ((await fs.readdir(parent)).includes(component)) throw cause;
-          const confirmedRoot = await fs.lstat(root);
-          if (!confirmedRoot.isDirectory() || confirmedRoot.isSymbolicLink()) throw new Error("Source root is unavailable");
+          await confirmRoot();
           return { state: "absent" };
         }
         if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw new Error("Unsupported source path");
         if (current !== target && info.isFile()) {
-          const confirmedRoot = await fs.lstat(root);
-          if (!confirmedRoot.isDirectory() || confirmedRoot.isSymbolicLink()) throw new Error("Source root is unavailable");
+          await confirmRoot();
           return { state: "absent" };
         }
-        if (current !== target && !info.isDirectory()) throw new Error("Source ancestor is not a directory");
       }
       return { state: "present", entry: { path: relative(root, target), kind: info.isDirectory() ? "directory" : "file", size: info.size, mtimeMs: info.mtimeMs } };
     },

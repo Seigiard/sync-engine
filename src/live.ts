@@ -1,5 +1,6 @@
-import { Deferred, Effect, Exit, Option, Queue, Scope, type Cause } from "effect";
-import { openSynchronization, scanSource, type InitialPass, type InitialPlan, type SourceEntry, type Synchronization, type ScanFailed, type OutputOwnershipFailed, type FreshnessFailed } from "./index.ts";
+import { Deferred, Effect, Exit, Queue, Scope, type Cause } from "effect";
+import { scanSource, type InitialPass, type InitialPlan, type SourceEntry, type Synchronization, type ScanFailed, type OutputOwnershipFailed, type FreshnessFailed } from "./index.ts";
+import { openSynchronizationWithHooks, type InternalSynchronization } from "./internal.ts";
 import type { WorkStatus } from "./work.ts";
 
 export interface PassRequest {
@@ -29,7 +30,8 @@ export interface LiveOptions<W, E, R> extends Omit<InitialPass<W, E, R>, "declar
    * Opt-in failure map for a failed attempt. Without it a defect or failed first pass fails the session. With it, a failure is
    * tolerated while output is usable: `existing` reports earlier output that already serves, and a successful
    * publication in this session also counts. If a request was already queued, the session performs one immediate
-   * retry; otherwise it reports `LiveStatus.failure` and reopens on the next `requestPass`/`notify` or reconcile tick.
+   * retry; if another request arrives during that retry and the retry fails, that newer request reopens at once.
+   * Otherwise it reports `LiveStatus.failure` and reopens on the next `requestPass`/`notify` or reconcile tick.
    * Without usable output the open still fails.
    */
   readonly recovery?: { readonly existing: Effect.Effect<boolean, never, R> };
@@ -59,10 +61,6 @@ export interface LiveHandle<W, E> extends LiveSynchronization<W, E> {
    * (see `LiveOptions.recovery`), and fails with the pass cause otherwise.
    */
   readonly ready: Effect.Effect<void, E | ScanFailed>;
-}
-
-interface LiveInternalSynchronization<W, E> extends Synchronization<W, E> {
-  readonly commitFreshness: Effect.Effect<void, E>;
 }
 
 const INITIAL: PassRequest = { kind: "initial", force: false, changedPaths: [] };
@@ -128,12 +126,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
       if (next.force || next.changedPaths.length > 0) yield* Effect.exit(target.submit([], { force: next.force, changedPaths: next.changedPaths }));
     });
 
-    const drainWake = Effect.gen(function* () {
-      while (true) {
-        const token = yield* Queue.poll(wake);
-        if (Option.isNone(token)) return;
-      }
-    });
+    const drainWakeUnsafe = () => { while (Queue.takeUnsafe(wake) !== undefined) {} };
 
     const startWorking = () => {
       if (state !== "working") completion = Deferred.makeUnsafe<void, Failure>();
@@ -190,7 +183,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
       return (yield* live.status).state === "failed";
     });
 
-    const runPass = (live: Synchronization<W, E | FreshnessFailed>, requested: PassRequest) => Effect.gen(function* () {
+    const runPass = (live: InternalSynchronization<W, E | FreshnessFailed>, requested: PassRequest) => Effect.gen(function* () {
       const entries = yield* scanSource(options.sourcePath, options.includeSource);
       const changedPaths = [...new Set([...requested.changedPaths, ...differences(baseline, entries)])];
       active = { ...requested, changedPaths };
@@ -198,14 +191,14 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
       yield* live.submit(plan.work, active);
       yield* live.awaitCompletion;
       yield* plan.publish;
-      yield* (live as LiveInternalSynchronization<W, E | FreshnessFailed>).commitFreshness;
+      yield* live.commitFreshness;
       baseline = entries;
       const after = yield* scanSource(options.sourcePath, options.includeSource);
       const changed = differences(entries, after);
       if (changed.length > 0) yield* request({ kind: "watcher", force: false, changedPaths: changed });
     });
 
-    const consume = (live: Synchronization<W, E | FreshnessFailed>) => Effect.gen(function* () {
+    const consume = (live: InternalSynchronization<W, E | FreshnessFailed>) => Effect.gen(function* () {
       while (true) {
         while (pending !== null) {
           const next = {
@@ -240,7 +233,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
       (scope) => Effect.gen(function* () {
         // The traversal after the first pass belongs to the open: a change it finds is already pending when `ready` settles.
         const opened = yield* Effect.exit(Effect.gen(function* () {
-          const synchronization = yield* openSynchronization({
+          const synchronization = yield* openSynchronizationWithHooks({
             ...options,
             // A plan that declares no minimum has published nothing usable when `onMinimum` runs.
             onMinimum: Effect.sync(() => { if (declaredMinimum) availability ??= "minimum-publication"; }).pipe(Effect.andThen(options.onMinimum ?? Effect.void)),
@@ -292,7 +285,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
       while (true) {
         const attemptWasOneShotRetry = retryAfterFailedOpening !== null;
         if (machine === "reopening" && retryAfterFailedOpening === null && pending !== null) {
-          reopenTrigger = pending;
+          reopenTrigger = reopenTrigger === null ? pending : combine(reopenTrigger, pending);
           pending = null;
         }
         machine = retryAfterFailedOpening === null ? "opening" : "retrying-after-failed-opening";
@@ -320,7 +313,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
         } else {
           retryAfterFailedOpening = null;
           if (!fatal) machine = "reopening";
-          yield* drainWake;
+          drainWakeUnsafe();
           if (wakeNewerPending) {
             state = "working";
             Queue.offerUnsafe(wake, undefined);
@@ -379,7 +372,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
         const work: WorkStatus<W> = scheduler !== undefined
           ? yield* scheduler.status
           : { state: state === "stopped" ? "stopped" : machine === "opening" || machine === "retrying-after-failed-opening" ? "working" : "failed", pending: 0, active: null, errors: [] };
-        return { state, pass: (machine === "opening" || machine === "retrying-after-failed-opening") && state !== "stopped" ? INITIAL : active, followUp: pending ?? retryAfterFailedOpening, failure, availability, work };
+        return { state, pass: (machine === "opening" || machine === "retrying-after-failed-opening") && state !== "stopped" ? INITIAL : active, followUp: pending ?? retryAfterFailedOpening ?? reopenTrigger, failure, availability, work };
       }),
     };
   });

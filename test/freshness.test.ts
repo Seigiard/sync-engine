@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Cause, Effect, Exit, Scope } from "effect";
-import { openFreshness, openSynchronization, runInitialPass, type InitialPass } from "../src/index.ts";
+import { openFreshness, openSynchronization, removeAssociatedOutputs, runInitialPass, type InitialPass } from "../src/index.ts";
 
 const io = <A>(run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: (cause) => new Error(String(cause)) }).pipe(Effect.uninterruptible);
 const ancient = new Date("2020-01-01T00:00:00Z");
@@ -315,6 +315,35 @@ test("freshness handle does not rewrite unchanged state after leaf work", async 
     }));
     // #then no second identical freshness write is required after the handler
     expect(result).toEqual({ handled: "handled", output: "Prepared" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("freshness treats a regular-file ancestor as confirmed absence for cleanup work", async () => {
+  // #given a described removed descendant whose parent path is now a regular file
+  const root = await mkdtemp(join(tmpdir(), "sync-freshness-file-ancestor-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const statePath = join(root, "state");
+  await mkdir(sourcePath);
+  await mkdir(join(outputPath, "folder"), { recursive: true });
+  await Bun.write(join(sourcePath, "folder"), "not a directory");
+  await Bun.write(join(outputPath, "folder", "book"), "Previous result");
+  try {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const freshness = yield* openFreshness({
+        sourcePath,
+        outputPath,
+        freshness: { describe: () => ({ sourcePaths: ["folder/book"], resultKind: "book", processingVersion: "v1", outputPaths: ["folder/book"] }) },
+        handle: () => removeAssociatedOutputs({ sourcePath, outputPath, sourceRelativePath: "folder/book", outputs: ["folder/book"] }).pipe(Effect.map(() => [] as string[])),
+      }, statePath);
+      // #when freshness stamps the descendant before running the cleanup handler
+      yield* freshness.handle("folder/book");
+      return yield* io(() => Bun.file(join(outputPath, "folder", "book")).exists());
+    }));
+    // #then ENOTDIR is treated as absence and the handler can confirm removal
+    expect(result).toBe(false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
