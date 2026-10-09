@@ -3,7 +3,7 @@
  * name its expected invariant; the unmutated reducer must stay green. A mutation that stays green is a defect in the
  * model, not in the reducer.
  *
- * Usage: bun scripts/calibrate-live-model.ts [--depth 10] [--only M1,M7] [--parallel 3]
+ * Usage: bun scripts/calibrate-live-model.ts [--depth 10] [--only M1,M7] [--parallel 3] [--no-baseline]
  */
 import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -162,7 +162,8 @@ async function run(mutation: Mutation | null): Promise<Outcome> {
   }
 }
 
-const queue: (Mutation | null)[] = [null, ...mutations.filter((mutation) => only === undefined || only.includes(mutation.id))];
+const baseline = process.argv.includes("--no-baseline") ? [] : [null];
+const queue: (Mutation | null)[] = [...baseline, ...mutations.filter((mutation) => only === undefined || only.includes(mutation.id))];
 const outcomes: Outcome[] = [];
 await Promise.all(Array.from({ length: parallel }, async () => {
   for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
