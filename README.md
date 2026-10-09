@@ -101,7 +101,9 @@ optional `onMinimum` Effect, then submits `work`. The application decides what
 the minimum is and what "ready" means; the engine reports only that the minimum
 finished. Completion still waits for all required work. A plan without `minimum`
 runs `onMinimum` right after declaration. Later live passes ignore `minimum`;
-list work that must repeat in `work` as well. `LiveStatus.failure` carries the
+list work that must repeat in `work` as well. A live session opens with an initial
+pass every time, including a reopen after a failed attempt, so the initial
+declaration, the minimum and `onMinimum` run again then; `onMinimum` must tolerate that. `LiveStatus.failure` carries the
 cause of the last recoverable failed pass or open until a later attempt succeeds.
 
 ## Freshness
@@ -195,7 +197,9 @@ Explicit watcher hints passed to `notify` keep their prefix semantics.
 The returned session exposes:
 
 - `notify(relativePaths)`: retain watcher hints and schedule reconsideration.
-- `requestPass({force})`: start a pass or combine into the pending follow-up.
+- `requestPass({force})`: start a pass or combine into the pending follow-up. Until the
+  running pass has claimed its request for `declare`, a new request joins that pass;
+  after the claim it joins the pending follow-up instead. The same holds for `notify`.
 - `awaitCompletion`: await admitted scans, processing, publication and follow-ups.
 - `status`: observe the active pass, pending request and work completion separately.
   `followUp` is a pass that is scheduled to run. Data retained from a failed pass or
@@ -209,6 +213,8 @@ attempt, releases the output lease, and follows the recovery policy below. Reque
 during that interval guarantee a follow-up. Pending requests combine, retaining
 every dirty path and any forced mode. A post-processing traversal detects source
 size, mtime, kind and membership changes and requests repair before completion.
+If that traversal fails after publication and freshness commit, the pass reports the
+failure, but its request counts as applied and does not run again.
 This includes the initial pass. Stable detectable sources converge after successful
 processing; traversal does not provide a filesystem snapshot.
 
@@ -241,7 +247,9 @@ attempts also invalidate freshness before that opening records anything. A disab
 (`reconcileIntervalMs: 0`) leaves only requests as retry triggers. Without usable output `ready` fails
 for the first pass, or a later attempt stops admission. Admission closes as soon as such a failure is
 detected (`state: "stopped"`); `ready` and completion fail only after the attempt has released the output
-lease. This is the one owner of retry and reconcile scheduling; applications keep no timer of their own.
+lease. If closing a failed attempt's scope fails too, for example a finalizer dies, that cause joins the
+attempt's failure and the same rule applies. This is the one owner of retry and reconcile scheduling;
+applications keep no timer of their own.
 
 ## Cooperative shutdown and restart
 

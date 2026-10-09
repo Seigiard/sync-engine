@@ -37,7 +37,10 @@ export interface InitialPass<W, E, R> extends WorkOptions<W, E, R> {
   /** Application-owned source policy. Excluded paths are skipped before filesystem traversal. */
   readonly includeSource?: (relativePath: string) => boolean;
   readonly declare: (entries: readonly SourceEntry[]) => Effect.Effect<InitialPlan<W, E, R>, E, R>;
-  /** Runs once, after the declared minimum finished without errors and before the remaining work starts. */
+  /**
+   * Runs once per initial pass, after the declared minimum finished without errors and before the remaining work
+   * starts. A live session runs an initial pass on every opening, so a reopen after a failed attempt runs it again.
+   */
   readonly onMinimum?: Effect.Effect<void, E, R>;
   readonly freshness?: FreshnessOptions<W>;
 }
