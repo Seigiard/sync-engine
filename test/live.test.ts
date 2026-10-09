@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, stat, utimes } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Cause, Effect, Exit, Scope } from "effect";
@@ -1892,6 +1892,40 @@ test("a successful later pass releases its scoped resources when it ends", async
     })));
     // #then no pass holds its resource after it ended
     expect(result).toEqual({ state: "complete", resource: { acquired: 3, released: 3 } });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed traversal after the initial pass fails the opening although it published", async () => {
+  // #given a session without recovery whose source root vanishes right after the initial publication
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-opening-traversal-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "document"), "Original");
+  try {
+    const scope = await Effect.runPromise(Scope.make());
+    const session = await Effect.runPromise(startLiveSynchronizationWithHooks({
+      sourcePath,
+      outputPath,
+      reconcileIntervalMs: 0,
+      declare: () => Effect.succeed({ work: ["document"], publish: Effect.void }),
+      handle: (path: string) => io(async () => { await Bun.write(join(outputPath, path), await readFile(join(sourcePath, path), "utf8")); return [] as string[]; }),
+    }, {
+      afterOpeningPublication: io(() => rename(sourcePath, join(root, "parked"))).pipe(Effect.orDie),
+    }).pipe(Scope.provide(scope))) as LiveHandle<string, Error>;
+    // #when the opening's trailing traversal fails
+    const ready = await Effect.runPromise(Effect.exit(session.ready));
+    const state = (await Effect.runPromise(session.status)).state;
+    const published = await readFile(join(outputPath, "document"), "utf8");
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    // #then the opening fails with the traversal error and the session stops, as the README states
+    expect({ ready: Exit.isFailure(ready) ? Cause.squash(ready.cause) : "succeeded", state, published }).toEqual({
+      ready: expect.objectContaining({ _tag: "ScanFailed" }),
+      state: "stopped",
+      published: "Original",
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

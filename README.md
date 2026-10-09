@@ -217,10 +217,15 @@ attempt, releases the output lease, and follows the recovery policy below. Reque
 during that interval guarantee a follow-up. Pending requests combine, retaining
 every dirty path and any forced mode. A post-processing traversal detects source
 size, mtime, kind and membership changes and requests repair before completion.
-If that traversal fails after publication and freshness commit, the pass reports the
-failure, but its request counts as applied and does not run again.
 This includes the initial pass. Stable detectable sources converge after successful
 processing; traversal does not provide a filesystem snapshot.
+If the traversal after a later pass fails after publication and freshness commit, the
+pass reports the failure, but its request counts as applied and does not run again.
+The traversal after the initial pass belongs to the opening: if it fails, the opening
+fails although it published and committed, and the recovery policy below decides what
+follows. Without `recovery` the session stops and `ready` fails; with it the attempt
+closes and the next request or tick runs the full first pass again. Requests admitted
+during the opening are never counted as applied by it; they stay retained.
 
 `reconcileIntervalMs` enables the scoped timer; zero disables it. A tick acts only
 while the session is idle (finished, or failed and waiting); while a pass or attempt
