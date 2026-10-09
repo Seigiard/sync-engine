@@ -355,7 +355,8 @@ function apply(source: Ghost, move: Move): Applied {
   if (accepted && (event.tag === "usable" || event.tag === "freshnessReady")) check(post.availability !== null, "V1", `${event.tag} left availability null`);
 
   // Admitted requests join the ghost after the step's own outcome bookkeeping.
-  const admittedRequest = admitted !== null && result.admission !== "rejected";
+  // A request admitted after stop is already an A1 violation; only live admissions join the ghost.
+  const admittedRequest = live && admitted !== null && result.admission !== "rejected";
   const tickStarts = event.tag === "tick" && live && (prePhase!.tag === "running" || prePhase!.tag === "waiting");
   if (admittedRequest || tickStarts) {
     const passing = prePhase?.tag === "passing" ? ghost.activity as Extract<Activity, { kind: "pass" }> : null;
@@ -508,9 +509,13 @@ interface Exploration {
   readonly goals: ReadonlySet<string>;
 }
 
-/** Every event sequence up to `depth`, memoized on a canonical configuration plus remaining depth (exact counts). */
+/**
+ * Every event sequence up to `depth`, memoized on a canonical configuration plus remaining depth. Keys are 64-bit
+ * hashes to keep memory bounded; with about 1.4 million keys per run a collision, which could skip one configuration,
+ * has a probability near 1e-7.
+ */
 function explore(config: Config, depth: number): Exploration {
-  const memo = new Map<string, number>();
+  const memo = new Map<number | bigint, number>();
   const violations = new Map<string, string>();
   const pairs = new Set<string>();
   const goals = new Set<string>();
@@ -518,7 +523,7 @@ function explore(config: Config, depth: number): Exploration {
   const trail: Move[] = [];
   const visit = (ghost: Ghost, remaining: number): number => {
     if (remaining === 0) return 1;
-    const key = `${canonical(ghost)}|${remaining}`;
+    const key = Bun.hash(`${canonical(ghost)}|${remaining}`);
     const known = memo.get(key);
     if (known !== undefined) return known;
     let count = 1;
