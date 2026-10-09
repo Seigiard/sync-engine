@@ -19,7 +19,8 @@ export interface SourceEntry {
 
 export interface InitialPlan<W, E, R> {
   /**
-   * Application-defined minimum: runs first and fails the open at once when it cannot finish.
+   * Application-defined minimum: runs first. A typed failure is reported after the minimum drains
+   * and before the remaining work starts.
    * It is not repeated by later passes; list work that must also run again in `work`.
    */
   readonly minimum?: readonly W[];
@@ -38,9 +39,11 @@ export interface InitialPass<W, E, R> extends WorkOptions<W, E, R> {
   readonly declare: (entries: readonly SourceEntry[]) => Effect.Effect<InitialPlan<W, E, R>, E, R>;
   /** Runs once, after the declared minimum finished without errors and before the remaining work starts. */
   readonly onMinimum?: Effect.Effect<void, E, R>;
-  /** Internal live hook: runs after publication and before successful freshness records are committed. */
-  readonly beforeCommit?: (synchronization: Synchronization<W, E | FreshnessFailed>) => Effect.Effect<void, E | FreshnessFailed, R>;
   readonly freshness?: FreshnessOptions<W>;
+}
+
+interface OpenSynchronizationInternal<W, E, R> {
+  readonly beforeCommit?: (synchronization: Synchronization<W, E | FreshnessFailed>) => Effect.Effect<void, E | FreshnessFailed, R>;
 }
 
 export interface Synchronization<W, E> extends WorkScheduler<W, E> {
@@ -94,7 +97,7 @@ export function runInitialPass<W, E, R>(options: InitialPass<W, E, R>): Effect.E
 }
 
 /** Completes initial publication, then keeps the lease and scheduler in the caller's scope. */
-export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>): Effect.Effect<Synchronization<W, E | FreshnessFailed>, E | FreshnessFailed | ScanFailed | OutputOwnershipFailed, R | Scope.Scope> {
+export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>, internal?: OpenSynchronizationInternal<W, E, R>): Effect.Effect<Synchronization<W, E | FreshnessFailed>, E | FreshnessFailed | ScanFailed | OutputOwnershipFailed, R | Scope.Scope> {
   return Effect.gen(function* () {
     // Validate before creating output directories, including aliases through existing symlinks.
     const source = yield* Effect.tryPromise({
@@ -143,7 +146,7 @@ export function openSynchronization<W, E, R>(options: InitialPass<W, E, R>): Eff
       awaitCompletion: Effect.suspend(() => closed ? Effect.interrupt : scheduler.awaitCompletion.pipe(Effect.andThen(Effect.suspend(() => closed ? Effect.interrupt : freshness.commit)))),
     };
     yield* plan.publish;
-    if (options.beforeCommit) yield* options.beforeCommit(synchronization);
+    if (internal?.beforeCommit) yield* internal.beforeCommit(synchronization);
     yield* freshness.commit;
     return synchronization;
   });

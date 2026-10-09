@@ -195,7 +195,7 @@ test("a defect stops other workers from enqueueing cascades after failure", asyn
       const failedExit = yield* Effect.exit(scheduler.awaitCompletion);
       const failed = Exit.isFailure(failedExit) ? "failed" : "completed";
       yield* Deferred.succeed(releaseHeld, undefined);
-      yield* Effect.sleep(25);
+      while ((yield* scheduler.status).active !== null) yield* Effect.sleep(1);
       const status = yield* scheduler.status;
       return {
         failed,
@@ -244,21 +244,33 @@ test("submit on a closed standalone scheduler interrupts", async () => {
 test("non-finite concurrency falls back to one worker", async () => {
   // #given a scheduler configured from a non-numeric external value
   const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-    const handled: string[] = [];
+    const firstEntered = yield* Deferred.make<void>();
+    const releaseFirst = yield* Deferred.make<void>();
+    const secondEntered = yield* Deferred.make<void>();
+    const started: string[] = [];
     const scheduler = yield* createWorkScheduler({
       concurrency: Number.NaN,
-      handle: (work: string) => Effect.sync(() => {
-        handled.push(work);
+      handle: (work: string) => Effect.gen(function* () {
+        started.push(work);
+        if (work === "first") {
+          yield* Deferred.succeed(firstEntered, undefined);
+          yield* Deferred.await(releaseFirst);
+        } else {
+          yield* Deferred.succeed(secondEntered, undefined);
+        }
         return [] as string[];
       }),
     });
     // #when work is submitted through the public scheduler
-    yield* scheduler.submit(["refresh"]);
-    const completion = yield* Effect.race(scheduler.awaitCompletion.pipe(Effect.as("completed")), Effect.sleep(25).pipe(Effect.as("pending")));
-    return { completion, handled, state: (yield* scheduler.status).state };
+    yield* scheduler.submit(["first", "second"]);
+    yield* Deferred.await(firstEntered);
+    const secondBeforeRelease = yield* Effect.race(Deferred.await(secondEntered).pipe(Effect.as("started")), Effect.sleep(25).pipe(Effect.as("blocked")));
+    yield* Deferred.succeed(releaseFirst, undefined);
+    yield* scheduler.awaitCompletion;
+    return { secondBeforeRelease, started, state: (yield* scheduler.status).state };
   })));
   // #then it is processed by the default single worker instead of hanging
-  expect(result).toEqual({ completion: "completed", handled: ["refresh"], state: "complete" });
+  expect(result).toEqual({ secondBeforeRelease: "blocked", started: ["first", "second"], state: "complete" });
 });
 
 test("undefined is a valid work item rather than an empty-queue sentinel", async () => {

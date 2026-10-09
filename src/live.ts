@@ -1,4 +1,4 @@
-import { Deferred, Effect, Exit, Queue, Scope, type Cause } from "effect";
+import { Deferred, Effect, Exit, Option, Queue, Scope, type Cause } from "effect";
 import { openSynchronization, scanSource, type InitialPass, type InitialPlan, type SourceEntry, type Synchronization, type ScanFailed, type OutputOwnershipFailed, type FreshnessFailed } from "./index.ts";
 import type { WorkStatus } from "./work.ts";
 
@@ -73,18 +73,19 @@ function differences(before: readonly SourceEntry[], after: readonly SourceEntry
  */
 export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>): Effect.Effect<LiveHandle<W, E | FreshnessFailed | OutputOwnershipFailed>, never, R | Scope.Scope> {
   type Failure = E | FreshnessFailed | ScanFailed | OutputOwnershipFailed;
+  type MachineState = "opening" | "running" | "retrying-after-failed-opening" | "reopening" | "stopped-fatal" | "stopped";
 
   return Effect.gen(function* () {
     let availability: Availability | null = options.recovery !== undefined && (yield* options.recovery.existing) ? "prior-output" : null;
     let baseline: readonly SourceEntry[] = [];
     let scheduler: Synchronization<W, E | FreshnessFailed> | undefined;
+    let openingScheduler: Synchronization<W, E | FreshnessFailed> | undefined;
     const wake = yield* Queue.unbounded<void>();
-    // `opening`: the first pass of a session attempt runs. `waiting`: an attempt failed and only a request or tick retries.
-    let opening = true;
-    let waiting = false;
+    let machine: MachineState = "opening";
     let declaredMinimum = false;
     let state: LiveStatus<W>["state"] = "working";
     let pending: PassRequest | null = null;
+    let retryAfterFailedOpening: PassRequest | null = null;
     let active: PassRequest | null = null;
     let carriedChangedPaths = new Set<string>();
     let carriedForce = false;
@@ -95,31 +96,57 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
     const ready = Deferred.makeUnsafe<void, Failure>();
     const settled = Deferred.makeUnsafe<void>();
 
-    const request = (next: PassRequest): PassAdmission => {
+    const combine = (left: PassRequest, right: PassRequest): PassRequest => ({
+      kind: left.kind === "resync" || right.kind === "resync" ? "resync" : right.kind,
+      force: left.force || right.force,
+      changedPaths: [...new Set([...left.changedPaths, ...right.changedPaths])],
+    });
+
+    const mergePending = (next: PassRequest) => {
+      pending = pending === null ? next : combine(pending, next);
+    };
+
+    const invalidateThrough = (target: Synchronization<W, E | FreshnessFailed> | undefined, next: PassRequest) => Effect.gen(function* () {
+      if (target === undefined) return;
+      if (next.force || next.changedPaths.length > 0) yield* Effect.exit(target.submit([], { force: next.force, changedPaths: next.changedPaths }));
+    });
+
+    const drainWake = Effect.gen(function* () {
+      while (true) {
+        const token = yield* Queue.poll(wake);
+        if (Option.isNone(token)) return;
+      }
+    });
+
+    const startWorking = () => {
+      if (state !== "working") completion = Deferred.makeUnsafe<void, Failure>();
+      state = "working";
+      failure = null;
+    };
+
+    const request = (next: PassRequest): Effect.Effect<PassAdmission> => Effect.gen(function* () {
       if (state === "stopped") return "rejected";
       const changedPaths = [...new Set([...carriedChangedPaths, ...next.changedPaths])];
       const force = carriedForce || next.force;
       carriedChangedPaths = new Set<string>();
       carriedForce = false;
       next = { ...next, force, changedPaths };
-      if (opening || scheduler === undefined) {
+      const inOpeningWindow = machine === "opening" || machine === "retrying-after-failed-opening" || openingScheduler !== undefined;
+      const invalidationTarget = inOpeningWindow ? openingScheduler ?? scheduler : scheduler;
+      if (inOpeningWindow) {
         openingForce ||= force;
         for (const path of changedPaths) openingChangedPaths.add(path);
       }
-      const busy = !waiting && (opening || active !== null || pending !== null);
-      if (state !== "working") completion = Deferred.makeUnsafe<void, Failure>();
-      state = "working";
-      pending = pending === null ? next : {
-        kind: pending.kind === "resync" || next.kind === "resync" ? "resync" : next.kind,
-        force: pending.force || next.force,
-        changedPaths: [...new Set([...pending.changedPaths, ...next.changedPaths])],
-      };
+      yield* invalidateThrough(invalidationTarget, next);
+      const busy = (machine === "opening" || machine === "retrying-after-failed-opening" || active !== null || pending !== null) && machine !== "reopening";
+      startWorking();
+      mergePending(next);
       if (!busy) {
-        waiting = false;
+        machine = scheduler === undefined ? "reopening" : "running";
         Queue.offerUnsafe(wake, undefined);
       }
       return busy ? "queued" : "started";
-    };
+    });
 
     const consumeOpeningInvalidation = () => {
       const input = { force: openingForce, changedPaths: [...openingChangedPaths] };
@@ -144,7 +171,7 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
       baseline = entries;
       const after = yield* scanSource(options.sourcePath, options.includeSource);
       const changed = differences(entries, after);
-      if (changed.length > 0) request({ kind: "watcher", force: false, changedPaths: changed });
+      if (changed.length > 0) yield* request({ kind: "watcher", force: false, changedPaths: changed });
     });
 
     const consume = (live: Synchronization<W, E | FreshnessFailed>) => Effect.gen(function* () {
@@ -190,7 +217,9 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
               baseline = entries;
               return options.declare(entries, INITIAL).pipe(Effect.tap((plan) => Effect.sync(() => { declaredMinimum = (plan.minimum?.length ?? 0) > 0; })));
             },
+          }, {
             beforeCommit: (live) => Effect.gen(function* () {
+              openingScheduler = live;
               const input = consumeOpeningInvalidation();
               if (input.force || input.changedPaths.length > 0) yield* live.submit([], input);
             }),
@@ -202,10 +231,19 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
         if (Exit.isFailure(opened)) return opened.cause;
         const live = opened.value.synchronization;
         scheduler = live;
-        opening = false;
+        openingScheduler = live;
+        machine = "running";
+        state = "working";
         failure = null;
+        availability ??= "minimum-publication";
+        if (retryAfterFailedOpening !== null) {
+          mergePending(retryAfterFailedOpening);
+          retryAfterFailedOpening = null;
+        }
         const initialChanges = differences(baseline, opened.value.afterInitial);
-        if (initialChanges.length > 0) request({ kind: "watcher", force: false, changedPaths: initialChanges });
+        if (initialChanges.length > 0) mergePending({ kind: "watcher", force: false, changedPaths: initialChanges });
+        consumeOpeningInvalidation();
+        openingScheduler = undefined;
         Deferred.doneUnsafe(ready, Effect.void);
         Deferred.doneUnsafe(settled, Effect.void);
         return yield* consume(live);
@@ -215,33 +253,41 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
 
     const supervise = Effect.gen(function* () {
       while (true) {
-        opening = true;
-        const cause = yield* attempt;
+        machine = retryAfterFailedOpening === null ? "opening" : "retrying-after-failed-opening";
+        const attemptExit = yield* Effect.exit(attempt);
+        const cause = Exit.isFailure(attemptExit) ? attemptExit.cause as Cause.Cause<Failure> : attemptExit.value;
         scheduler = undefined;
-        opening = false;
+        openingScheduler = undefined;
         failure = cause;
         state = "failed";
         // Without usable output a served-but-empty deployment would be a lie.
         const fatal = options.recovery === undefined || availability === null;
-        const retryNow = !fatal && pending !== null;
+        const retryNow = !fatal && retryAfterFailedOpening === null && pending !== null;
         // Settle the flags before any Deferred: a waiter may resume inline and must see a consistent session.
-        waiting = !fatal;
         if (fatal) {
+          machine = "stopped-fatal";
           state = "stopped";
         }
-        if (!retryNow) Deferred.doneUnsafe(completion, Effect.failCause(cause));
+        if (retryNow) {
+          retryAfterFailedOpening = pending;
+          pending = null;
+          machine = "retrying-after-failed-opening";
+          state = "working";
+        } else {
+          retryAfterFailedOpening = null;
+          yield* drainWake;
+          Deferred.doneUnsafe(completion, Effect.failCause(cause));
+        }
 
         if (fatal) {
           Deferred.doneUnsafe(ready, Effect.failCause(cause));
           return;
         }
+        if (!retryNow) machine = "reopening";
         Deferred.doneUnsafe(ready, Effect.void);
         Deferred.doneUnsafe(settled, Effect.void);
-        if (pending === null) {
+        if (!retryNow) {
           yield* Queue.take(wake);
-        } else {
-          state = "working";
-          waiting = false;
         }
       }
     });
@@ -251,16 +297,17 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
     if ((options.reconcileIntervalMs ?? 0) > 0) {
       yield* Effect.forkScoped(Effect.gen(function* () {
         // The timer starts after the first outcome, so it neither queues a pass behind the open nor races the retry.
-        yield* Deferred.await(settled);
-        while (true) {
-          yield* Effect.sleep(options.reconcileIntervalMs!);
-          request({ kind: "reconcile", force: false, changedPaths: [] });
-        }
-      }));
+          yield* Deferred.await(settled);
+          while (true) {
+            yield* Effect.sleep(options.reconcileIntervalMs!);
+            yield* request({ kind: "reconcile", force: false, changedPaths: [] });
+          }
+        }));
     }
 
     // Registered last, so it runs first when the scope closes: admission stops before the fibers are joined.
     yield* Effect.addFinalizer(() => Effect.sync(() => {
+      machine = "stopped";
       state = "stopped";
       pending = null;
       Deferred.doneUnsafe(completion, Effect.interrupt);
@@ -270,12 +317,12 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
     return {
       requestPass: (input = {}) => Effect.gen(function* () {
         const force = input.force ?? false;
-        const admission = request({ kind: "resync", force, changedPaths: [] });
+        const admission = yield* request({ kind: "resync", force, changedPaths: [] });
         if (admission !== "rejected" && force && scheduler !== undefined) yield* Effect.exit(scheduler.submit([], { force: true }));
         return admission;
       }),
       notify: (changedPaths) => Effect.gen(function* () {
-        const admission = request({ kind: "watcher", force: false, changedPaths });
+        const admission = yield* request({ kind: "watcher", force: false, changedPaths });
         if (admission !== "rejected" && changedPaths.length > 0 && scheduler !== undefined) yield* Effect.exit(scheduler.submit([], { changedPaths }));
         return admission;
       }),
@@ -284,8 +331,8 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
       status: Effect.gen(function* () {
         const work: WorkStatus<W> = scheduler !== undefined
           ? yield* scheduler.status
-          : { state: state === "stopped" ? "stopped" : opening ? "working" : "failed", pending: 0, active: null, errors: [] };
-        return { state, pass: opening && state !== "stopped" ? INITIAL : active, followUp: pending, failure, availability, work };
+          : { state: state === "stopped" ? "stopped" : machine === "opening" || machine === "retrying-after-failed-opening" ? "working" : "failed", pending: 0, active: null, errors: [] };
+        return { state, pass: (machine === "opening" || machine === "retrying-after-failed-opening") && state !== "stopped" ? INITIAL : active, followUp: pending ?? retryAfterFailedOpening, failure, availability, work };
       }),
     };
   });

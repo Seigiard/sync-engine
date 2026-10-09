@@ -277,7 +277,7 @@ test("requests made while the first pass is held combine and apply after it", as
   }
 });
 
-test("a request made during a first pass that then fails does not block the next request from retrying", async () => {
+test("a request made during a first pass that then fails is consumed by the immediate retry", async () => {
   // #given prior output and a first pass held inside a handler that will fail
   const { root, sourcePath, outputPath } = await workspace("sync-engine-queued-then-failed-");
   await mkdir(sourcePath);
@@ -311,17 +311,17 @@ test("a request made during a first pass that then fails does not block the next
           failing = false;
           release.open();
           yield* session.ready;
-          const failed = yield* session.status;
-          // #and a later request arrives
+          const retrying = yield* session.status;
+          // #and a later request arrives while the immediate retry is active
           const later = yield* session.requestPass();
           yield* session.awaitCompletion;
 
-          return { during, failed: failed.state, later, current: yield* io(() => readFile(join(outputPath, "reference"), "utf8")) };
+          return { during, retrying: retrying.state, later, current: yield* io(() => readFile(join(outputPath, "reference"), "utf8")) };
         }),
       ),
     );
-    // #then the later request retried instead of queueing behind the stale one
-    expect(result).toEqual({ during: "queued", failed: "failed", later: "started", current: "Current publication" });
+    // #then the queued request drives the retry, and later admission queues behind it
+    expect(result).toEqual({ during: "queued", retrying: "working", later: "queued", current: "Current publication" });
   } finally {
     release.open();
     await rm(root, { recursive: true, force: true });
