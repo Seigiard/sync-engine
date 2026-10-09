@@ -19,7 +19,8 @@
     "lint": "oxlint --deny-warnings src test scripts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "verify:pack": "bun scripts/verify-pack.ts"
+    "verify:pack": "bun scripts/verify-pack.ts",
+    "prepare": "if [ -e .git ]; then lefthook install; fi"
   },
   "peerDependencies": {
     "effect": "4.0.1"
@@ -28,7 +29,8 @@
     "effect": "4.0.1",
     "@types/bun": "1.3.14",
     "typescript": "5.9.3",
-    "oxlint": "1.87.0"
+    "oxlint": "1.87.0",
+    "lefthook": "2.2.1"
   },
   "publishConfig": {
     "access": "public"
