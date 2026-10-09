@@ -553,7 +553,7 @@ test("a queued request retries immediately after a recoverable opening failure",
       yield* session.awaitCompletion;
       return { admission, attempts, reference: yield* io(() => readFile(join(outputPath, "reference"), "utf8")) };
     })));
-    // #then the pending request wakes the retry, then runs as the retained follow-up
+    // #then the request admitted during the failed opening starts one more attempt, then runs as its follow-up
     expect(result).toEqual({ admission: "queued", attempts: 3, reference: "Recovered" });
   } finally {
     release.open();
@@ -599,7 +599,7 @@ test("a queued retry after repeated recoverable opening failures settles instead
       const status = yield* session.status;
       return { admission, completionFailed: Exit.isFailure(completion), attempts, state: status.state, followUp: status.followUp };
     })));
-    // #then the one-shot retry is consumed and the session waits instead of looping, with no follow-up scheduled
+    // #then the retry's own trigger starts no further attempt, so the session waits instead of looping, with no follow-up scheduled
     expect(result).toEqual({ admission: "queued", completionFailed: true, attempts: 2, state: "failed", followUp: null });
   } finally {
     release.open();
@@ -643,9 +643,9 @@ test("a request-triggered reopen failure does not spend an immediate second atte
   }
 });
 
-test("a request queued during a failed one-shot retry still wakes a later attempt", async () => {
-  // #given a recoverable opening failure that is already consuming its one-shot retry
-  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-retry-pending-wake-"));
+test("a request admitted during a failed retry attempt starts another attempt", async () => {
+  // #given a recoverable opening failure followed by a retry attempt
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-retry-arrival-"));
   const sourcePath = join(root, "source");
   const outputPath = join(root, "output");
   await mkdir(sourcePath);
@@ -685,14 +685,14 @@ test("a request queued during a failed one-shot retry still wakes a later attemp
       const firstAdmission = yield* session.requestPass();
       releaseFirst.open();
       yield* io(() => retryEntered.promise);
-      // #when another request is accepted while the one-shot retry is active
+      // #when another request is admitted while the retry attempt runs
       const secondAdmission = yield* session.requestPass();
       releaseRetry.open();
       yield* session.awaitCompletion;
       const status = yield* session.status;
       return { firstAdmission, secondAdmission, attempts, state: status.state, reference: yield* io(() => readFile(join(outputPath, "reference"), "utf8")) };
     })));
-    // #then the newer pending request gets its own wake even though the retry failed
+    // #then that request starts another attempt even though the retry failed
     expect(result).toEqual({ firstAdmission: "queued", secondAdmission: "queued", attempts: 4, state: "complete", reference: "Recovered" });
   } finally {
     releaseFirst.open();
@@ -701,7 +701,7 @@ test("a request queued during a failed one-shot retry still wakes a later attemp
   }
 });
 
-test("reconcile ticks do not keep completion outstanding while a one-shot retry fails", async () => {
+test("reconcile ticks during a failing retry attempt do not keep completion outstanding", async () => {
   // #given a positive reconcile interval shorter than a held failing retry
   const root = await mkdtemp(join(tmpdir(), "sync-engine-live-retry-timer-"));
   const sourcePath = join(root, "source");
@@ -864,8 +864,8 @@ test.each([
   ["during first opening -> open ok", "opening-ok"],
   ["during first opening -> open fail -> retry ok", "opening-fail-retry-ok"],
   ["during first opening -> open fail -> retry fail -> reopen ok", "opening-fail-retry-fail-reopen-ok"],
-  ["during one-shot retry -> retry ok", "retry-ok"],
-  ["during one-shot retry -> retry fail -> reopen ok", "retry-fail-reopen-ok"],
+  ["during the retry attempt -> retry ok", "retry-ok"],
+  ["during the retry attempt -> retry fail -> reopen ok", "retry-fail-reopen-ok"],
   ["during reopen -> open ok", "reopen-ok"],
   ["during reopen -> open fail -> later open ok", "reopen-fail-later-ok"],
   ["while running -> recoverable defect -> retry ok", "running-recoverable-defect"],
@@ -879,7 +879,7 @@ test.each([
   });
 });
 
-test.each(["force", "hint"])("a request admitted during a one-shot retry preserves earlier %s payload", async (mode) => {
+test.each(["force", "hint"])("a request admitted during a retry attempt preserves earlier %s payload", async (mode) => {
   // #given a recoverable opening whose queued retry carries force or a source hint
   const root = await mkdtemp(join(tmpdir(), `sync-engine-live-retry-payload-${mode}-`));
   const sourcePath = join(root, "source");
@@ -977,7 +977,7 @@ test.each(["force", "hint"])("a reopen trigger preserves %s across a failed reop
 });
 
 test.each(["force", "hint"])("a reopen trigger preserves %s through a failed retry chain", async (mode) => {
-  // #given a failed recoverable session that will fail the trigger attempt and its one-shot retry
+  // #given a failed recoverable session that will fail the trigger attempt and the retry attempt that follows it
   const root = await mkdtemp(join(tmpdir(), `sync-engine-live-retry-trigger-${mode}-`));
   const sourcePath = join(root, "source");
   const outputPath = join(root, "output");
@@ -1100,7 +1100,7 @@ test("a completion waiter request after recoverable open failure starts the reop
       yield* session.awaitCompletion;
       return { admission, reference: yield* io(() => readFile(join(outputPath, "reference"), "utf8")) };
     })));
-    // #then the request gets a wake and runs instead of being queued forever
+    // #then the request starts the reopen and runs instead of being queued forever
     expect(result).toEqual({ admission: "started", reference: "Recovered" });
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1192,9 +1192,9 @@ test("ready waiters cannot orphan an outstanding retry completion", async () => 
   }
 });
 
-test("a stale wake after a failed post-open follow-up does not reopen without a request", async () => {
+test("a failed post-open follow-up does not reopen without a request", async () => {
   // #given after-initial changes that queue a follow-up which then defects
-  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-stale-wake-"));
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-no-unrequested-reopen-"));
   const sourcePath = join(root, "source");
   const outputPath = join(root, "output");
   await mkdir(sourcePath);
@@ -1229,7 +1229,7 @@ test("a stale wake after a failed post-open follow-up does not reopen without a 
       const status = yield* session.status;
       return { failed: Exit.isFailure(failed), declarations, state: status.state, failure: status.failure !== null };
     })));
-    // #then the stale wake is drained and no unrequested reopen runs
+    // #then no unrequested reopen runs
     expect(result).toEqual({ failed: true, declarations: 2, state: "failed", failure: true });
   } finally {
     await rm(root, { recursive: true, force: true });
