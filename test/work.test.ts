@@ -508,3 +508,27 @@ test("submitting keyed work evaluates each item's key once", async () => {
   // #then the cost is one key evaluation per submitted item, not one per pending pair
   expect(result).toEqual({ calls: 2000, pending: 2000 });
 });
+
+test("a keyed cascade enqueued behind a very large pending queue keeps the scheduler working", async () => {
+  // #given a queue larger than any engine's call-argument limit (Bun 1.4.2 fails at about 700k, Node at 100k–150k)
+  const size = 2_000_000;
+  const items = Array.from({ length: size }, (_, index) => `item-${index}`);
+  const firstHeld = Promise.withResolvers<void>();
+  const secondStarted = Promise.withResolvers<void>();
+  const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const scheduler = yield* createWorkScheduler({
+      key: (work: string) => work,
+      handle: (work: string) => work === "item-0"
+        ? Effect.promise(() => firstHeld.promise).pipe(Effect.as(["cascade"]))
+        : Effect.sync(() => secondStarted.resolve()).pipe(Effect.andThen(Effect.never)),
+    });
+    yield* scheduler.submit(items);
+    // #when the first handler returns a keyed follow-up while the rest of the plan is still pending
+    firstHeld.resolve();
+    const next = yield* Effect.race(Effect.promise(() => secondStarted.promise).pipe(Effect.as("next item started" as const)), Effect.sleep(5000).pipe(Effect.as("no item started" as const)));
+    const status = yield* scheduler.status;
+    return { next, state: status.state, pending: status.pending };
+  })));
+  // #then the follow-up joins the queue and the next item runs; the scheduler does not fail
+  expect(result).toEqual({ next: "next item started", state: "working", pending: size - 1 });
+}, 30_000);

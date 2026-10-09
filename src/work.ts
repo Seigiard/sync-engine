@@ -45,16 +45,18 @@ export function createWorkScheduler<W, E, R>(options: WorkOptions<W, E, R>): Eff
 
     // A repeated request reflects later changes: an earlier equivalent pending item is dropped and the latest one
     // queues behind intervening work. Each key is evaluated once, so a full plan costs linear time.
+    // The queue is compacted in place: spreading it into call arguments overflows the engine limit on large plans.
     const enqueue = (work: readonly W[]) => {
       const keys = work.map((item) => options.key?.(item));
       const latest = new Map<string, number>();
       keys.forEach((key, index) => { if (key !== undefined) latest.set(key, index); });
       if (latest.size > 0) {
-        const kept = pending.filter((item) => {
+        let kept = 0;
+        for (const item of pending) {
           const key = options.key?.(item);
-          return key === undefined || !latest.has(key);
-        });
-        pending.splice(0, pending.length, ...kept);
+          if (key === undefined || !latest.has(key)) pending[kept++] = item;
+        }
+        pending.length = kept;
       }
       work.forEach((item, index) => {
         const key = keys[index];
