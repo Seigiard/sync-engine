@@ -11,8 +11,15 @@ export interface PassRequest {
 
 export type PassAdmission = "started" | "queued" | "rejected";
 
-/** `prior-output`: usable output existed before the session. `minimum-publication`: this session published the minimum. */
+/** `prior-output`: usable output existed before the session. `minimum-publication`: this session published usable output. */
 export type Availability = "prior-output" | "minimum-publication";
+
+interface LiveInternalHooks {
+  /** Test seam for the opening window after publication and before freshness commit. */
+  readonly afterOpeningPublication?: Effect.Effect<void>;
+  /** Test seam after request invalidation and before admission bookkeeping. */
+  readonly afterRequestInvalidation?: Effect.Effect<void>;
+}
 
 export interface LiveOptions<W, E, R> extends Omit<InitialPass<W, E, R>, "declare"> {
   readonly declare: (entries: readonly SourceEntry[], request: PassRequest) => Effect.Effect<InitialPlan<W, E, R>, E, R>;
@@ -20,9 +27,10 @@ export interface LiveOptions<W, E, R> extends Omit<InitialPass<W, E, R>, "declar
   readonly reconcileIntervalMs?: number;
   /**
    * Opt-in failure map for a failed attempt. Without it a defect or failed first pass fails the session. With it, a failure is
-   * tolerated while output is usable: `existing` reports earlier output that already serves, and a published
-   * minimum also counts. The session then stays up, reports `LiveStatus.failure`, and reopens on the next
-   * `requestPass`/`notify` or reconcile tick. Without usable output the open still fails.
+   * tolerated while output is usable: `existing` reports earlier output that already serves, and a successful
+   * publication in this session also counts. If a request was already queued, the session performs one immediate
+   * retry; otherwise it reports `LiveStatus.failure` and reopens on the next `requestPass`/`notify` or reconcile tick.
+   * Without usable output the open still fails.
    */
   readonly recovery?: { readonly existing: Effect.Effect<boolean, never, R> };
 }
@@ -33,7 +41,7 @@ export interface LiveStatus<W> {
   readonly followUp: PassRequest | null;
   /** Cause of the last failed recoverable pass/open; a later successful attempt clears it. */
   readonly failure: Cause.Cause<unknown> | null;
-  /** Null until output is usable. Only sessions that declare `recovery` or a `minimum` can report it. */
+  /** Null until output is usable. */
   readonly availability: Availability | null;
   readonly work: WorkStatus<W>;
 }
@@ -71,7 +79,7 @@ function differences(before: readonly SourceEntry[], after: readonly SourceEntry
  * Owns scan, processing, required publication, follow-up, the periodic timer and the retry of a failed attempt.
  * The handle is usable at once: requests made before the first pass finished combine and run after it.
  */
-export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>): Effect.Effect<LiveHandle<W, E | FreshnessFailed | OutputOwnershipFailed>, never, R | Scope.Scope> {
+export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>, internal: LiveInternalHooks = {}): Effect.Effect<LiveHandle<W, E | FreshnessFailed | OutputOwnershipFailed>, never, R | Scope.Scope> {
   type Failure = E | FreshnessFailed | ScanFailed | OutputOwnershipFailed;
   type MachineState = "opening" | "running" | "retrying-after-failed-opening" | "reopening" | "stopped-fatal" | "stopped";
 
@@ -121,11 +129,21 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
     const startWorking = () => {
       if (state !== "working") completion = Deferred.makeUnsafe<void, Failure>();
       state = "working";
-      failure = null;
     };
 
+    const clearQueued = () => {
+      pending = null;
+      retryAfterFailedOpening = null;
+      carriedChangedPaths = new Set<string>();
+      carriedForce = false;
+      openingChangedPaths = new Set<string>();
+      openingForce = false;
+    };
+
+    const isStopped = () => state === "stopped";
+
     const request = (next: PassRequest): Effect.Effect<PassAdmission> => Effect.gen(function* () {
-      if (state === "stopped") return "rejected";
+      if (isStopped()) return "rejected";
       const changedPaths = [...new Set([...carriedChangedPaths, ...next.changedPaths])];
       const force = carriedForce || next.force;
       carriedChangedPaths = new Set<string>();
@@ -138,6 +156,8 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
         for (const path of changedPaths) openingChangedPaths.add(path);
       }
       yield* invalidateThrough(invalidationTarget, next);
+      yield* (internal.afterRequestInvalidation ?? Effect.void);
+      if (isStopped()) return "rejected";
       const busy = (machine === "opening" || machine === "retrying-after-failed-opening" || active !== null || pending !== null) && machine !== "reopening";
       startWorking();
       mergePending(next);
@@ -219,9 +239,11 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
             },
           }, {
             beforeCommit: (live) => Effect.gen(function* () {
+              availability ??= "minimum-publication";
               openingScheduler = live;
               const input = consumeOpeningInvalidation();
               if (input.force || input.changedPaths.length > 0) yield* live.submit([], input);
+              yield* (internal.afterOpeningPublication ?? Effect.void);
             }),
           });
           // An initial traversal is not a snapshot either.
@@ -235,7 +257,6 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
         machine = "running";
         state = "working";
         failure = null;
-        availability ??= "minimum-publication";
         if (retryAfterFailedOpening !== null) {
           mergePending(retryAfterFailedOpening);
           retryAfterFailedOpening = null;
@@ -267,6 +288,7 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
         if (fatal) {
           machine = "stopped-fatal";
           state = "stopped";
+          clearQueued();
         }
         if (retryNow) {
           retryAfterFailedOpening = pending;
@@ -275,6 +297,7 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
           state = "working";
         } else {
           retryAfterFailedOpening = null;
+          if (!fatal) machine = "reopening";
           yield* drainWake;
           Deferred.doneUnsafe(completion, Effect.failCause(cause));
         }
@@ -283,7 +306,6 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
           Deferred.doneUnsafe(ready, Effect.failCause(cause));
           return;
         }
-        if (!retryNow) machine = "reopening";
         Deferred.doneUnsafe(ready, Effect.void);
         Deferred.doneUnsafe(settled, Effect.void);
         if (!retryNow) {
@@ -309,7 +331,7 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
     yield* Effect.addFinalizer(() => Effect.sync(() => {
       machine = "stopped";
       state = "stopped";
-      pending = null;
+      clearQueued();
       Deferred.doneUnsafe(completion, Effect.interrupt);
       Deferred.doneUnsafe(ready, Effect.interrupt);
     }));
@@ -318,12 +340,10 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
       requestPass: (input = {}) => Effect.gen(function* () {
         const force = input.force ?? false;
         const admission = yield* request({ kind: "resync", force, changedPaths: [] });
-        if (admission !== "rejected" && force && scheduler !== undefined) yield* Effect.exit(scheduler.submit([], { force: true }));
         return admission;
       }),
       notify: (changedPaths) => Effect.gen(function* () {
         const admission = yield* request({ kind: "watcher", force: false, changedPaths });
-        if (admission !== "rejected" && changedPaths.length > 0 && scheduler !== undefined) yield* Effect.exit(scheduler.submit([], { changedPaths }));
         return admission;
       }),
       awaitCompletion: Effect.suspend(() => Deferred.await(completion)),

@@ -223,10 +223,13 @@ follow-up pass after the open, keeping force and every hint.
 Without `recovery` a failed first pass or later pass defect stops the session. With
 `recovery: { existing }` the engine tolerates it while output is usable: `existing` reports earlier
 output that already serves (read once before the first pass), and a published `minimum` counts
-too. `status.availability` reports `"prior-output"`, `"minimum-publication"` or `null`. A tolerated
-failure resolves `ready`, sets `status.failure` and `state: "failed"`, releases the lease and waits.
-The next `requestPass`/`notify` (reports `started`) or reconcile tick reopens the session in the
-same scope: a full first pass again, then any retained request. A disabled timer
+too. A completed first publication also counts as usable output. `status.availability` reports
+`"prior-output"`, `"minimum-publication"` or `null`; `"minimum-publication"` means this session has
+published usable output, either minimum or full first publication. A tolerated failure resolves `ready`,
+sets `status.failure` and `state: "failed"`, releases the lease and waits unless a request was already
+queued during the failed attempt. In that case it performs one immediate retry in `state: "working"`;
+if that retry also fails, completion fails and the session waits for a fresh request or tick. The next
+`requestPass`/`notify` (reports `started`) or reconcile tick reopens the session in the same scope: a full first pass again, then any retained request. A disabled timer
 (`reconcileIntervalMs: 0`) leaves only requests as retry triggers. Without usable output `ready` fails
 for the first pass, or a later attempt stops admission. This is the one owner of retry and reconcile
 scheduling; applications keep no timer of their own.
