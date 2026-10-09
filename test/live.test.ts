@@ -778,8 +778,8 @@ test("a queued retry after repeated recoverable opening failures settles instead
       const status = yield* session.status;
       return { admission, completionFailed: Exit.isFailure(completion), attempts, state: status.state, followUp: status.followUp };
     })));
-    // #then the one-shot retry is consumed and the session waits instead of looping
-    expect(result).toEqual({ admission: "queued", completionFailed: true, attempts: 2, state: "failed", followUp: { kind: "resync", force: false, changedPaths: [] } });
+    // #then the one-shot retry is consumed and the session waits instead of looping, with no follow-up scheduled
+    expect(result).toEqual({ admission: "queued", completionFailed: true, attempts: 2, state: "failed", followUp: null });
   } finally {
     release.open();
     await rm(root, { recursive: true, force: true });
@@ -816,7 +816,7 @@ test("a request-triggered reopen failure does not spend an immediate second atte
       return { admission, failed: Exit.isFailure(completion), attemptsAfterRequest: attempts - before, state: status.state, followUp: status.followUp };
     })));
     // #then the trigger is consumed by that attempt and is not retried as if it had queued during the attempt
-    expect(result).toEqual({ admission: "started", failed: true, attemptsAfterRequest: 1, state: "failed", followUp: { kind: "resync", force: false, changedPaths: [] } });
+    expect(result).toEqual({ admission: "started", failed: true, attemptsAfterRequest: 1, state: "failed", followUp: null });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -1,38 +1,32 @@
-import { Deferred, Effect, Exit, Queue, Scope, type Cause } from "effect";
-import { scanSource, type InitialPass, type InitialPlan, type SourceEntry, type Synchronization, type ScanFailed, type OutputOwnershipFailed, type FreshnessFailed } from "./index.ts";
+import { Deferred, Effect, Exit, Fiber, Scope, type Cause } from "effect";
+import { scanSource, type InitialPass, type InitialPlan, type SourceEntry, type ScanFailed, type OutputOwnershipFailed, type FreshnessFailed } from "./index.ts";
 import { openSynchronizationWithHooks, type InternalSynchronization } from "./internal.ts";
+import { INITIAL, init, invalidationTarget, Payload, step, view, type Availability, type Command, type Event, type PassAdmission, type PassRequest, type Session, type Settlement } from "./live-machine.ts";
 import type { WorkStatus } from "./work.ts";
 
-export interface PassRequest {
-  readonly kind: "initial" | "resync" | "watcher" | "reconcile";
-  readonly force: boolean;
-  /** Relative source paths; hints bypass source metadata equality. */
-  readonly changedPaths: readonly string[];
-}
-
-export type PassAdmission = "started" | "queued" | "rejected";
-
-/** `prior-output`: usable output existed before the session. `minimum-publication`: this session published usable output. */
-export type Availability = "prior-output" | "minimum-publication";
+export type { Availability, PassAdmission, PassRequest } from "./live-machine.ts";
 
 interface LiveInternalHooks {
   /** Test seam for the opening window after publication and before freshness commit. */
   readonly afterOpeningPublication?: Effect.Effect<void>;
   /** Test seam after request invalidation and before admission bookkeeping. */
   readonly afterRequestInvalidation?: Effect.Effect<void>;
+  /** Test seam in a failed attempt's close, after its activity ended and before its scope closes. */
+  readonly beforeAttemptClose?: (attempt: number) => Effect.Effect<void>;
+  /** Test seam after a failed attempt's scope closed and before the session learns that. */
+  readonly afterAttemptClose?: (attempt: number) => Effect.Effect<void>;
 }
 
 export interface LiveOptions<W, E, R> extends Omit<InitialPass<W, E, R>, "declare"> {
   readonly declare: (entries: readonly SourceEntry[], request: PassRequest) => Effect.Effect<InitialPlan<W, E, R>, E, R>;
-  /** Zero disables the owned periodic timer. */
+  /** Zero disables the owned periodic timer. A tick acts only while the session is idle. */
   readonly reconcileIntervalMs?: number;
   /**
    * Opt-in failure map for a failed attempt. Without it a defect or failed first pass fails the session. With it, a failure is
    * tolerated while output is usable: `existing` reports earlier output that already serves, and a successful
-   * publication in this session also counts. If a request was already queued, the session performs one immediate
-   * retry; if another request arrives during that retry and the retry fails, that newer request reopens at once.
-   * Otherwise it reports `LiveStatus.failure` and reopens on the next `requestPass`/`notify` or reconcile tick.
-   * Without usable output the open still fails.
+   * publication in this session also counts. A request admitted during the failed attempt starts one more attempt at
+   * once; the request that started the attempt does not count. Otherwise it reports `LiveStatus.failure` and reopens on
+   * the next `requestPass`/`notify` or reconcile tick. Without usable output the open still fails.
    */
   readonly recovery?: { readonly existing: Effect.Effect<boolean, never, R> };
 }
@@ -40,6 +34,7 @@ export interface LiveOptions<W, E, R> extends Omit<InitialPass<W, E, R>, "declar
 export interface LiveStatus<W> {
   readonly state: WorkStatus<W>["state"];
   readonly pass: PassRequest | null;
+  /** A follow-up pass that is scheduled to run; retained data of a failed pass joins the next request instead. */
   readonly followUp: PassRequest | null;
   /** Cause of the last failed recoverable pass/open; a later successful attempt clears it. */
   readonly failure: Cause.Cause<unknown> | null;
@@ -63,8 +58,6 @@ export interface LiveHandle<W, E> extends LiveSynchronization<W, E> {
   readonly ready: Effect.Effect<void, E | ScanFailed>;
 }
 
-const INITIAL: PassRequest = { kind: "initial", force: false, changedPaths: [] };
-
 function differences(before: readonly SourceEntry[], after: readonly SourceEntry[]): string[] {
   const previous = new Map(before.map((entry) => [entry.path, entry]));
   const changed = new Set<string>();
@@ -85,281 +78,197 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
   return startLiveSynchronizationWithHooks(options);
 }
 
+/**
+ * Interpreter of `live-machine.ts`. It decides nothing: `dispatch` commits the next session value, then executes the
+ * commands, and every activity reports its outcome as exactly one event.
+ */
 export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<W, E, R>, internal: LiveInternalHooks = {}): Effect.Effect<LiveHandle<W, E | FreshnessFailed | OutputOwnershipFailed>, never, R | Scope.Scope> {
   type Failure = E | FreshnessFailed | ScanFailed | OutputOwnershipFailed;
-  type MachineState = "opening" | "running" | "retrying-after-failed-opening" | "reopening" | "stopped-fatal" | "stopped";
+  type Live = InternalSynchronization<W, E | FreshnessFailed>;
+  interface Attempt {
+    readonly scope: Scope.Closeable;
+    live?: Live;
+    activity?: Fiber.Fiber<void>;
+    closed: boolean;
+  }
 
   return Effect.gen(function* () {
-    type RequestSlot = "pending" | "retry" | "reopen" | "carried" | "opening";
-    let availability: Availability | null = options.recovery !== undefined && (yield* options.recovery.existing) ? "prior-output" : null;
-    let baseline: readonly SourceEntry[] = [];
-    let scheduler: Synchronization<W, E | FreshnessFailed> | undefined;
-    let openingScheduler: Synchronization<W, E | FreshnessFailed> | undefined;
-    const wake = yield* Queue.unbounded<void>();
-    let machine: MachineState = "opening";
-    let declaredMinimum = false;
-    let state: LiveStatus<W>["state"] = "working";
-    let active: PassRequest | null = null;
-    const held: Record<RequestSlot, PassRequest | null> = { pending: null, retry: null, reopen: null, carried: null, opening: null };
-    let failure: Cause.Cause<Failure> | null = null;
-    let completion = Deferred.makeUnsafe<void, Failure>();
+    const services = yield* Effect.context<R | Scope.Scope>();
+    const existing = options.recovery !== undefined && (yield* options.recovery.existing);
+    const first = init<Cause.Cause<Failure>>({ recovery: options.recovery !== undefined, availability: existing ? "prior-output" : null });
+    let state: Session<Cause.Cause<Failure>> = first.state;
+    const attempts = new Map<number, Attempt>();
+    const fibers = new Set<Fiber.Fiber<void>>();
+    const completions = new Map<number, Deferred.Deferred<void, Failure>>();
     const ready = Deferred.makeUnsafe<void, Failure>();
-    const settled = Deferred.makeUnsafe<void>();
+    // Written only by the one running activity (opening or pass); the machine never reads source entries.
+    let baseline: readonly SourceEntry[] = [];
 
-    const combine = (left: PassRequest, right: PassRequest): PassRequest => ({
-      kind: left.kind === "resync" || right.kind === "resync" ? "resync" : right.kind,
-      force: left.force || right.force,
-      changedPaths: [...new Set([...left.changedPaths, ...right.changedPaths])],
-    });
-
-    const addHeld = (slot: RequestSlot, next: PassRequest) => {
-      held[slot] = held[slot] === null ? next : combine(held[slot], next);
-    };
-
-    const takeHeld = (slot: RequestSlot) => {
-      const next = held[slot];
-      held[slot] = null;
-      return next;
-    };
-
-    const mergePending = (next: PassRequest) => {
-      addHeld("pending", next);
-    };
-
-    const invalidateThrough = (target: Synchronization<W, E | FreshnessFailed> | undefined, next: PassRequest) => Effect.gen(function* () {
-      if (target === undefined) return;
-      if (next.force || next.changedPaths.length > 0) yield* Effect.exit(target.submit([], { force: next.force, changedPaths: next.changedPaths }));
-    });
-
-    const drainWakeUnsafe = () => { while (Queue.takeUnsafe(wake) !== undefined) {} };
-
-    const startWorking = () => {
-      if (state !== "working") completion = Deferred.makeUnsafe<void, Failure>();
-      state = "working";
-    };
-
-    const clearQueued = () => {
-      held.pending = null;
-      held.retry = null;
-      held.reopen = null;
-      held.carried = null;
-      held.opening = null;
-    };
-
-    const isStopped = () => state === "stopped";
-
-    const request = (next: PassRequest): Effect.Effect<PassAdmission> => Effect.gen(function* () {
-      if (isStopped()) return "rejected";
-      const carried = takeHeld("carried");
-      if (carried !== null) next = combine(carried, next);
-      const inOpeningWindow = machine === "opening" || machine === "retrying-after-failed-opening" || openingScheduler !== undefined;
-      const invalidationTarget = inOpeningWindow ? openingScheduler ?? scheduler : scheduler;
-      if (inOpeningWindow) {
-        addHeld("opening", next);
+    const completionFor = (gen: number) => {
+      let deferred = completions.get(gen);
+      if (deferred === undefined) {
+        deferred = Deferred.makeUnsafe<void, Failure>();
+        completions.set(gen, deferred);
       }
-      yield* invalidateThrough(invalidationTarget, next);
+      return deferred;
+    };
+
+    const settlement = (exit: Settlement<Cause.Cause<Failure>>): Effect.Effect<void, Failure> =>
+      exit.tag === "success" ? Effect.void : exit.tag === "failure" ? Effect.failCause(exit.cause) : Effect.interrupt;
+
+    // Detached fibers carry the session's services; the session finalizers own their interruption.
+    const track = (effect: Effect.Effect<void, never, R | Scope.Scope>): Effect.Effect<Fiber.Fiber<void>> => Effect.gen(function* () {
+      const fiber = yield* Effect.forkDetach(effect.pipe(Effect.provideContext(services)));
+      fibers.add(fiber);
+      fiber.addObserver(() => fibers.delete(fiber));
+      return fiber;
+    });
+
+    // Starting activities first and settling Deferreds last means an inline-resumed waiter observes launched work.
+    const execute = (commands: readonly Command<Cause.Cause<Failure>>[]): Effect.Effect<Cause.Cause<E | FreshnessFailed> | null> => Effect.gen(function* () {
+      for (const command of commands) {
+        if (command.tag === "startAttempt") yield* startAttempt(command.attempt);
+        if (command.tag === "startPass") yield* startPass(command.attempt, command.pass);
+        if (command.tag === "closeAttempt") yield* track(closeAttempt(command.attempt, command.cause));
+      }
+      let failure: Cause.Cause<E | FreshnessFailed> | null = null;
+      for (const command of commands) {
+        if (command.tag !== "invalidate") continue;
+        const live = attempts.get(command.attempt)?.live;
+        if (live === undefined) continue;
+        const exit = yield* Effect.exit(live.submit([], { force: command.force, changedPaths: command.paths }));
+        if (Exit.isFailure(exit)) failure ??= exit.cause;
+      }
+      for (const command of commands) {
+        if (command.tag === "settleCompletion") {
+          Deferred.doneUnsafe(completionFor(command.gen), settlement(command.exit));
+          for (const gen of completions.keys()) if (gen < state.ids.gen) completions.delete(gen);
+        }
+        if (command.tag === "settleReady") Deferred.doneUnsafe(ready, settlement(command.exit));
+      }
+      return failure;
+    });
+
+    const dispatch = (event: Event<Cause.Cause<Failure>>): Effect.Effect<{ readonly admission: PassAdmission | null; readonly claimed: PassRequest | undefined; readonly failure: Cause.Cause<E | FreshnessFailed> | null }> => Effect.suspend(() => {
+      const next = step(state, event);
+      state = next.state;
+      return execute(next.commands).pipe(Effect.map((failure) => ({ admission: next.admission, claimed: next.claimed, failure })));
+    }).pipe(Effect.uninterruptible);
+
+    const report = (event: Event<Cause.Cause<Failure>>): Effect.Effect<void> => dispatch(event).pipe(Effect.asVoid);
+
+    const opening = (attempt: number, entry: Attempt): Effect.Effect<void, never, R> => Effect.gen(function* () {
+      let declaredMinimum = false;
+      const opened = yield* Effect.exit(Effect.gen(function* () {
+        yield* openSynchronizationWithHooks({
+          ...options,
+          // A plan that declares no minimum has published nothing usable when `onMinimum` runs.
+          onMinimum: Effect.suspend(() => declaredMinimum ? report({ tag: "usable", attempt }) : Effect.void).pipe(Effect.andThen(options.onMinimum ?? Effect.void)),
+          declare: (entries) => {
+            baseline = entries;
+            return options.declare(entries, INITIAL).pipe(Effect.tap((plan) => Effect.sync(() => { declaredMinimum = (plan.minimum?.length ?? 0) > 0; })));
+          },
+        }, {
+          deferCommit: true,
+          beforeCommit: (live) => Effect.gen(function* () {
+            entry.live = live;
+            const { failure } = yield* dispatch({ tag: "freshnessReady", attempt });
+            if (failure !== null) return yield* Effect.failCause(failure);
+            yield* (internal.afterOpeningPublication ?? Effect.void);
+          }),
+        }).pipe(Scope.provide(entry.scope));
+        // The traversal after the first pass belongs to the open: a change it finds is already due when `ready` settles.
+        const afterInitial = yield* scanSource(options.sourcePath, options.includeSource);
+        return differences(baseline, afterInitial);
+      }));
+      yield* report(Exit.isSuccess(opened) ? { tag: "openOk", attempt, changes: opened.value } : { tag: "openFail", attempt, cause: opened.cause });
+    });
+
+    const startAttempt = (attempt: number): Effect.Effect<void> => Effect.gen(function* () {
+      // The machine starts an attempt only after the previous one closed, so older entries hold no resources.
+      for (const key of attempts.keys()) if (key < attempt) attempts.delete(key);
+      const entry: Attempt = { scope: yield* Scope.make(), closed: false };
+      attempts.set(attempt, entry);
+      entry.activity = yield* track(opening(attempt, entry));
+    });
+
+    const runPass = (attempt: number, pass: number): Effect.Effect<void, never, R> => Effect.gen(function* () {
+      const live = attempts.get(attempt)!.live!;
+      const exit = yield* Effect.exit(Effect.gen(function* () {
+        const entries = yield* scanSource(options.sourcePath, options.includeSource);
+        const { claimed: declared } = yield* dispatch({ tag: "passClaim", pass, changes: differences(baseline, entries) });
+        // Only a stopped session refuses the claim; the pass then declares nothing.
+        if (declared === undefined) return yield* Effect.interrupt;
+        const plan = yield* options.declare(entries, declared);
+        yield* live.submit(plan.work, declared);
+        yield* live.awaitCompletion;
+        yield* plan.publish;
+        yield* live.commitFreshness;
+        baseline = entries;
+        const outcome = (yield* live.status).state === "complete-with-errors" ? "complete-with-errors" as const : "complete" as const;
+        const after = yield* scanSource(options.sourcePath, options.includeSource);
+        return { outcome, changes: differences(entries, after) };
+      }));
+      if (Exit.isSuccess(exit)) return yield* report({ tag: "passOk", pass, ...exit.value });
+      // Typed failures keep the attempt; a defect, an interruption or a failed scheduler ends it.
+      const endsAttempt = exit.cause.reasons.some((reason) => reason._tag !== "Fail") || (yield* live.status).state === "failed";
+      yield* report({ tag: "passFail", pass, cause: exit.cause, endsAttempt });
+    });
+
+    const startPass = (attempt: number, pass: number): Effect.Effect<void> => Effect.gen(function* () {
+      const entry = attempts.get(attempt)!;
+      entry.activity = yield* track(runPass(attempt, pass));
+    });
+
+    const closeEntry = (entry: Attempt, exit: Exit.Exit<unknown, unknown>) => Effect.suspend(() => {
+      if (entry.closed) return Effect.void;
+      entry.closed = true;
+      return Scope.close(entry.scope, exit);
+    });
+
+    const closeAttempt = (attempt: number, cause: Cause.Cause<Failure>): Effect.Effect<void> => Effect.gen(function* () {
+      const entry = attempts.get(attempt)!;
+      // The activity reported this failure as its last act; wait for it so nothing runs once the lease is released.
+      if (entry.activity !== undefined) yield* Fiber.await(entry.activity);
+      if (internal.beforeAttemptClose) yield* internal.beforeAttemptClose(attempt);
+      yield* closeEntry(entry, Exit.failCause(cause));
+      if (internal.afterAttemptClose) yield* internal.afterAttemptClose(attempt);
+      yield* report({ tag: "attemptClosed", attempt });
+    });
+
+    const request = (payload: Payload): Effect.Effect<PassAdmission> => Effect.gen(function* () {
+      // Invalidate before the admission step: a commit after admission then cannot record a read older than the hint.
+      const target = invalidationTarget(state);
+      const live = target === null ? undefined : attempts.get(target)?.live;
+      let appliedTo: number | null = null;
+      if (live !== undefined && Payload.invalidates(payload)) {
+        const exit = yield* Effect.exit(live.submit([], { force: payload.force, changedPaths: payload.paths }));
+        if (Exit.isSuccess(exit)) appliedTo = target;
+      }
       yield* (internal.afterRequestInvalidation ?? Effect.void);
-      if (isStopped()) return "rejected";
-      const busy = (machine === "opening" || machine === "retrying-after-failed-opening" || active !== null || held.pending !== null) && machine !== "reopening";
-      startWorking();
-      mergePending(next);
-      if (!busy) {
-        machine = scheduler === undefined ? "reopening" : "running";
-        Queue.offerUnsafe(wake, undefined);
-      }
-      return busy ? "queued" : "started";
+      const { admission } = yield* dispatch({ tag: "request", payload, appliedTo });
+      return admission!;
     });
 
-    const consumeOpeningInvalidation = () => {
-      const input = takeHeld("opening");
-      return input === null ? { force: false, changedPaths: [] } : { force: input.force, changedPaths: input.changedPaths };
-    };
-
-    const shouldEndAttempt = (cause: Cause.Cause<Failure>, live: Synchronization<W, E | FreshnessFailed>) => Effect.gen(function* () {
-      if (cause.reasons.some((reason) => reason._tag !== "Fail")) return true;
-      return (yield* live.status).state === "failed";
-    });
-
-    const runPass = (live: InternalSynchronization<W, E | FreshnessFailed>, requested: PassRequest) => Effect.gen(function* () {
-      const entries = yield* scanSource(options.sourcePath, options.includeSource);
-      const changedPaths = [...new Set([...requested.changedPaths, ...differences(baseline, entries)])];
-      active = { ...requested, changedPaths };
-      const plan = yield* options.declare(entries, active);
-      yield* live.submit(plan.work, active);
-      yield* live.awaitCompletion;
-      yield* plan.publish;
-      yield* live.commitFreshness;
-      baseline = entries;
-      const after = yield* scanSource(options.sourcePath, options.includeSource);
-      const changed = differences(entries, after);
-      if (changed.length > 0) yield* request({ kind: "watcher", force: false, changedPaths: changed });
-    });
-
-    const consume = (live: InternalSynchronization<W, E | FreshnessFailed>) => Effect.gen(function* () {
-      while (true) {
-        while (held.pending !== null) {
-          const pending = takeHeld("pending")!;
-          const carried = takeHeld("carried");
-          const next = carried === null ? pending : combine(carried, pending);
-          active = next;
-          const exit = yield* Effect.exit(runPass(live, next));
-          if (Exit.isFailure(exit)) {
-            addHeld("carried", next);
-          }
-          active = null;
-          failure = Exit.isFailure(exit) ? exit.cause : null;
-          if (failure !== null && (yield* shouldEndAttempt(failure, live))) return failure;
-        }
-        if (state === "working") {
-          state = failure === null ? (yield* live.status).state : "failed";
-          Deferred.doneUnsafe(completion, failure === null ? Effect.void : Effect.failCause(failure));
-        }
-        yield* Queue.take(wake);
-      }
-    });
-
-    // One attempt owns its lease and scheduler in a scope of its own, so a failed attempt releases both before the retry.
-    const attempt = Effect.acquireUseRelease(
-      Scope.make(),
-      (scope) => Effect.gen(function* () {
-        // The traversal after the first pass belongs to the open: a change it finds is already pending when `ready` settles.
-        const opened = yield* Effect.exit(Effect.gen(function* () {
-          const synchronization = yield* openSynchronizationWithHooks({
-            ...options,
-            // A plan that declares no minimum has published nothing usable when `onMinimum` runs.
-            onMinimum: Effect.sync(() => { if (declaredMinimum) availability ??= "minimum-publication"; }).pipe(Effect.andThen(options.onMinimum ?? Effect.void)),
-            declare: (entries) => {
-              baseline = entries;
-              return options.declare(entries, INITIAL).pipe(Effect.tap((plan) => Effect.sync(() => { declaredMinimum = (plan.minimum?.length ?? 0) > 0; })));
-            },
-          }, {
-            deferCommit: true,
-            beforeCommit: (live) => Effect.gen(function* () {
-              availability ??= "minimum-publication";
-              openingScheduler = live;
-              const input = consumeOpeningInvalidation();
-              if (input.force || input.changedPaths.length > 0) yield* live.submit([], input);
-              yield* (internal.afterOpeningPublication ?? Effect.void);
-            }),
-          });
-          // An initial traversal is not a snapshot either.
-          const afterInitial = yield* scanSource(options.sourcePath, options.includeSource);
-          return { synchronization, afterInitial };
-        }).pipe(Scope.provide(scope)));
-        if (Exit.isFailure(opened)) return opened.cause;
-        const live = opened.value.synchronization;
-        scheduler = live;
-        openingScheduler = live;
-        machine = "running";
-        state = "working";
-        failure = null;
-        const retry = takeHeld("retry");
-        if (retry !== null) mergePending(retry);
-        const reopen = takeHeld("reopen");
-        if (reopen !== null) mergePending(reopen);
-        const initialChanges = differences(baseline, opened.value.afterInitial);
-        if (initialChanges.length > 0) mergePending({ kind: "watcher", force: false, changedPaths: initialChanges });
-        consumeOpeningInvalidation();
-        openingScheduler = undefined;
-        Deferred.doneUnsafe(ready, Effect.void);
-        Deferred.doneUnsafe(settled, Effect.void);
-        return yield* consume(live);
-      }).pipe(Effect.ensuring(Effect.sync(() => { active = null; }))),
-      (scope, exit) => Scope.close(scope, exit),
-    );
-
-    const supervise = Effect.gen(function* () {
-      while (true) {
-        const attemptWasOneShotRetry = held.retry !== null;
-        if (machine === "reopening" && held.retry === null && held.pending !== null) {
-          const pending = takeHeld("pending")!;
-          addHeld("reopen", pending);
-        }
-        machine = held.retry === null ? "opening" : "retrying-after-failed-opening";
-        const attemptExit = yield* Effect.exit(attempt);
-        const cause = Exit.isFailure(attemptExit) ? attemptExit.cause as Cause.Cause<Failure> : attemptExit.value;
-        scheduler = undefined;
-        openingScheduler = undefined;
-        failure = cause;
-        state = "failed";
-        // Without usable output a served-but-empty deployment would be a lie.
-        const fatal = options.recovery === undefined || availability === null;
-        const retryNow = !fatal && held.retry === null && held.pending !== null;
-        const wakeNewerPending = !fatal && attemptWasOneShotRetry && held.pending !== null;
-        // Settle the flags before any Deferred: a waiter may resume inline and must see a consistent session.
-        if (fatal) {
-          machine = "stopped-fatal";
-          state = "stopped";
-          clearQueued();
-        }
-        if (retryNow) {
-          const pending = takeHeld("pending")!;
-          addHeld("retry", pending);
-          machine = "retrying-after-failed-opening";
-          state = "working";
-        } else {
-          const retry = takeHeld("retry");
-          if (retry !== null) addHeld("reopen", retry);
-          if (!fatal) machine = "reopening";
-          drainWakeUnsafe();
-          if (wakeNewerPending) {
-            state = "working";
-          } else {
-            Deferred.doneUnsafe(completion, Effect.failCause(cause));
-          }
-        }
-
-        if (fatal) {
-          Deferred.doneUnsafe(ready, Effect.failCause(cause));
-          return;
-        }
-        Deferred.doneUnsafe(ready, Effect.void);
-        if (!retryNow) Deferred.doneUnsafe(settled, Effect.void);
-        if (!retryNow && !wakeNewerPending) {
-          yield* Queue.take(wake);
-        }
-      }
-    });
-
-    yield* Effect.forkScoped(supervise);
-
+    // Finalizers run in reverse: admission stops first, then activities are joined, then attempt scopes release leases.
+    yield* Effect.addFinalizer(() => Effect.forEach([...attempts.values()], (entry) => closeEntry(entry, Exit.void), { discard: true }));
+    yield* Effect.addFinalizer(() => Fiber.interruptAll([...fibers]));
     if ((options.reconcileIntervalMs ?? 0) > 0) {
-      yield* Effect.forkScoped(Effect.gen(function* () {
-        // The timer starts after the first outcome, so it neither queues a pass behind the open nor races the retry.
-          yield* Deferred.await(settled);
-          while (true) {
-            yield* Effect.sleep(options.reconcileIntervalMs!);
-            yield* request({ kind: "reconcile", force: false, changedPaths: [] });
-          }
-        }));
+      yield* Effect.forkScoped(Effect.forever(Effect.sleep(options.reconcileIntervalMs!).pipe(Effect.andThen(report({ tag: "tick" })))));
     }
-
-    // Registered last, so it runs first when the scope closes: admission stops before the fibers are joined.
-    yield* Effect.addFinalizer(() => Effect.sync(() => {
-      machine = "stopped";
-      state = "stopped";
-      clearQueued();
-      Deferred.doneUnsafe(completion, Effect.interrupt);
-      Deferred.doneUnsafe(ready, Effect.interrupt);
-    }));
+    yield* Effect.addFinalizer(() => report({ tag: "stop" }));
+    yield* execute(first.commands);
 
     return {
-      requestPass: (input = {}) => Effect.gen(function* () {
-        const force = input.force ?? false;
-        const admission = yield* request({ kind: "resync", force, changedPaths: [] });
-        return admission;
-      }),
-      notify: (changedPaths) => Effect.gen(function* () {
-        const admission = yield* request({ kind: "watcher", force: false, changedPaths });
-        return admission;
-      }),
-      awaitCompletion: Effect.suspend(() => Deferred.await(completion)),
+      requestPass: (input = {}) => request(Payload.of("resync", input.force ?? false, [])),
+      notify: (changedPaths) => request(Payload.of("watcher", false, changedPaths)),
+      awaitCompletion: Effect.suspend(() => Deferred.await(completionFor(state.ids.gen))),
       ready: Effect.suspend(() => Deferred.await(ready)),
-      status: Effect.gen(function* () {
-        const work: WorkStatus<W> = scheduler !== undefined
-          ? yield* scheduler.status
-          : { state: state === "stopped" ? "stopped" : machine === "opening" || machine === "retrying-after-failed-opening" ? "working" : "failed", pending: 0, active: null, errors: [] };
-        return { state, pass: (machine === "opening" || machine === "retrying-after-failed-opening") && state !== "stopped" ? INITIAL : active, followUp: held.pending ?? held.retry ?? held.reopen, failure, availability, work };
+      status: Effect.suspend(() => {
+        const current = view(state);
+        const live = current.work.attempt === null ? undefined : attempts.get(current.work.attempt)?.live;
+        const work: Effect.Effect<WorkStatus<W>> = live !== undefined ? live.status : Effect.succeed({ state: current.work.fallback, pending: 0, active: null, errors: [] });
+        return work.pipe(Effect.map((work) => ({ state: current.state, pass: current.pass, followUp: current.followUp, failure: current.failure, availability: current.availability, work })));
       }),
     };
   });
