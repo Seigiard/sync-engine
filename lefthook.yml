@@ -1,0 +1,12 @@
+glob_matcher: doublestar
+
+pre-commit:
+  piped: true
+  jobs:
+    - name: lint
+      glob: '**/*.{ts,tsx,js,jsx,mjs,cjs}'
+      run: bunx --no-install oxlint --fix --deny-warnings {staged_files}
+      stage_fixed: true
+    - name: typecheck
+      glob: '**/*.{ts,tsx}'
+      run: bun run typecheck
