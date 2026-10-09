@@ -3,7 +3,8 @@
  * name its expected invariant; the unmutated reducer must stay green. A mutation that stays green is a defect in the
  * model, not in the reducer.
  *
- * Usage: bun scripts/calibrate-live-model.ts [--depth 10] [--only M1,M7] [--parallel 3] [--no-baseline]
+ * Usage: bun scripts/calibrate-live-model.ts [--depth 10] [--only M1,M7] [--parallel 3] [--no-baseline] [--dry-run]
+ * `--dry-run` only checks that every selected mutation anchor matches the reducer exactly once.
  */
 import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -58,7 +59,7 @@ const mutations: readonly Mutation[] = [
   },
   {
     id: "M6", name: "a failed attempt waits without settling completion", expect: "C2",
-    search: `        commands: [...readyCommands(state), { tag: "settleCompletion", gen: state.ids.gen, exit: { tag: "failure", cause: phase.cause } }],`,
+    search: `        commands: [...readyCommands(state), { tag: "settleCompletion", gen: state.ids.gen, exit: { tag: "failure", cause } }],`,
     replace: `        commands: [...readyCommands(state)],`,
   },
   {
@@ -110,15 +111,49 @@ const mutations: readonly Mutation[] = [
     search: `return phase.tag === "passing" || phase.tag === "running" ? phase.attempt : null;`,
     replace: `return phase.tag === "passing" || phase.tag === "running" || phase.tag === "closing" ? phase.attempt : null;`,
   },
+  {
+    id: "M16", name: "a pass that failed after its commit owes its payload again (round 10)", expect: "P2",
+    search: `const owed = event.discharged ? state.owed : Payload.combine(phase.payload, state.owed);`,
+    replace: `const owed = Payload.combine(phase.payload, state.owed);`,
+  },
+  {
+    id: "M17", name: "a closing attempt shows a carried trigger as scheduled (round 10)", expect: "W1",
+    search: `followUp: owed(phase.due === "arrived"), work: { attempt: phase.attempt, fallback: "failed" } };`,
+    replace: `followUp: owed(phase.due !== "none"), work: { attempt: phase.attempt, fallback: "failed" } };`,
+  },
+  {
+    id: "M18", name: "a request during an opening makes output usable (round 10)", expect: "V1",
+    search: `    case "opening":
+    case "closing":
+      return { state: { ...state, phase: { ...phase, due: "arrived" }, owed }, commands: retarget, admission: "queued" };`,
+    replace: `    case "opening":
+    case "closing":
+      return { state: { ...state, phase: { ...phase, due: "arrived" }, owed, availability: state.availability ?? "minimum-publication" }, commands: retarget, admission: "queued" };`,
+  },
+  {
+    id: "M19", name: "a failed close drops its cause (round 10)", expect: "S2",
+    search: `const cause = event.cause ?? phase.cause;`,
+    replace: `const cause = phase.cause;`,
+  },
 ];
 
 const argument = (name: string) => {
   const index = process.argv.indexOf(name);
   return index === -1 ? undefined : process.argv[index + 1];
 };
+const fail = (message: string): never => {
+  console.error(message);
+  process.exit(2);
+};
 const depth = argument("--depth") ?? process.env.LIVE_MODEL_DEPTH ?? "10";
+if (!/^[1-9]\d*$/.test(depth)) fail(`--depth must be a positive integer, got ${depth}`);
+const parallelText = argument("--parallel") ?? "3";
+if (!/^[1-9]\d*$/.test(parallelText)) fail(`--parallel must be a positive integer, got ${parallelText}`);
+const parallel = Number(parallelText);
 const only = argument("--only")?.split(",");
-const parallel = Number(argument("--parallel") ?? 3);
+const known = new Set(["none", ...mutations.map((mutation) => mutation.id)]);
+const unknown = (only ?? []).filter((id) => !known.has(id));
+if (unknown.length > 0) fail(`unknown --only ids: ${unknown.join(", ")}; known: ${[...known].join(", ")}`);
 const root = resolve(import.meta.dir, "..");
 const machinePath = "src/live-machine.ts";
 
@@ -163,7 +198,17 @@ async function run(mutation: Mutation | null): Promise<Outcome> {
 }
 
 const baseline = process.argv.includes("--no-baseline") ? [] : [null];
-const queue: (Mutation | null)[] = [...baseline, ...mutations.filter((mutation) => only === undefined || only.includes(mutation.id))];
+const selected = mutations.filter((mutation) => only === undefined || only.includes(mutation.id));
+const source = await readFile(join(root, machinePath), "utf8");
+const broken = selected.filter((mutation) => source.split(mutation.search).length - 1 !== 1).map((mutation) => mutation.id);
+if (broken.length > 0) fail(`anchors that do not match the reducer exactly once: ${broken.join(", ")}`);
+if (process.argv.includes("--dry-run")) {
+  console.log(`anchors ok: ${selected.map((mutation) => mutation.id).join(", ")}`);
+  process.exit(0);
+}
+const queue: (Mutation | null)[] = [...baseline, ...selected];
+const expected = queue.length;
+if (expected === 0) fail("nothing selected to run");
 const outcomes: Outcome[] = [];
 await Promise.all(Array.from({ length: parallel }, async () => {
   for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
@@ -178,4 +223,5 @@ outcomes.sort((left, right) => order(left.id) - order(right.id));
 console.log(`\n| Mutation | Result | Expected | Named | Seconds | Calibrated |\n| --- | --- | --- | --- | --- | --- |`);
 for (const outcome of outcomes) console.log(`| ${outcome.id} ${outcome.name} | ${outcome.red ? "RED" : "GREEN"} | ${outcome.expect} | ${outcome.named.join(", ") || "-"} | ${outcome.seconds} | ${outcome.ok ? "yes" : "NO"} |`);
 console.log(`\ndepth ${depth}`);
+if (outcomes.length !== expected) fail(`ran ${outcomes.length} of ${expected} selected cases`);
 if (outcomes.some((outcome) => !outcome.ok)) process.exit(1);
