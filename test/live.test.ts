@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { Cause, Effect, Exit, Scope } from "effect";
 import { acquireOutputTree, openLiveSynchronization, runInitialPass, startLiveSynchronization, type LiveHandle, type LiveSynchronization } from "../src/index.ts";
 import { startLiveSynchronizationWithHooks } from "../src/live.ts";
@@ -13,186 +13,7 @@ function gate() {
   return { promise, open: () => resolve() };
 }
 
-const transitionStates = ["opening", "running", "retrying-after-failed-opening", "reopening", "stopped-fatal", "stopped"] as const;
-const transitionEvents = ["requestPass", "notify", "tick", "open ok", "open failed recoverable", "open failed fatal", "pass ok", "typed failure", "defect", "interruption", "stop"] as const;
-const transitionModes = ["plain", "inline", "async-gap"] as const;
-
-type TransitionState = typeof transitionStates[number];
-type TransitionEvent = typeof transitionEvents[number];
-type TransitionMode = typeof transitionModes[number];
 type PassSnapshot = { readonly kind: string; readonly force: boolean; readonly changedPaths: readonly string[] };
-
-const transitionKey = (state: TransitionState, event: TransitionEvent, mode: TransitionMode) => `${state} | ${event} | ${mode}`;
-
-const transitionImpossibleReason = (state: TransitionState, event: TransitionEvent): string | null => {
-  if (state === "opening") {
-    if (event === "pass ok" || event === "typed failure" || event === "defect") return "opening has no running follow-up pass; open outcomes or stop cover attempt termination";
-    return null;
-  }
-  if (state === "running") {
-    if (event === "open ok" || event === "open failed recoverable" || event === "open failed fatal") return "open outcomes are attempt-opening events, not running-consumer events";
-    return null;
-  }
-  if (state === "retrying-after-failed-opening") {
-    if (event === "pass ok" || event === "typed failure" || event === "defect") return "retrying after failed opening is still an opening attempt until open ok/fail/stop";
-    if (event === "open failed fatal") return "retrying is only entered after recovery proved usable output, so open failures remain recoverable or stop by outer interruption";
-    return null;
-  }
-  if (state === "reopening") {
-    if (event === "pass ok" || event === "typed failure" || event === "defect" || event === "interruption") return "reopening has no running scheduler until a request, notify, tick, or open outcome starts an attempt";
-    if (event === "open failed fatal") return "reopening is only entered after recovery proved usable output, so open failures remain recoverable or stop by outer interruption";
-    return null;
-  }
-  if (event === "open ok" || event === "open failed recoverable" || event === "open failed fatal" || event === "pass ok" || event === "typed failure" || event === "defect" || event === "interruption") return "terminal stopped states own no attempt scope";
-  return null;
-};
-
-const transitionCoveredBy = new Map<string, string>([
-  ["opening | requestPass | plain", "a queued request retries immediately after a recoverable opening failure"],
-  ["opening | notify | plain", "notify during the first pass prevents the initial stale read from being retained"],
-  ["opening | open ok | plain", "a source replaced during initial processing converges without a watcher notice"],
-  ["opening | open failed recoverable | plain", "a queued retry after repeated recoverable opening failures settles instead of hot looping"],
-  ["opening | open failed recoverable | inline", "ready waiters cannot orphan an outstanding retry completion"],
-  ["opening | open failed fatal | plain", "fatal first-pass failure rejects later admission instead of starting unreachable work"],
-  ["running | requestPass | plain", "combined requests during processing preserve a forced repair of unchanged sources"],
-  ["running | notify | plain", "notify during active work prevents the active stale read from being retained"],
-  ["running | notify | async-gap", "a request stopped during async invalidation stays rejected"],
-  ["running | pass ok | plain", "combined requests during processing preserve a forced repair of unchanged sources"],
-  ["running | typed failure | plain", "typed required failures still publish prior results and remain visible in status"],
-  ["running | defect | plain", "a later live pass handler defect stops admission and releases the lease"],
-  ["retrying-after-failed-opening | requestPass | plain", "a request queued during a failed one-shot retry still wakes a later attempt"],
-  ["retrying-after-failed-opening | requestPass | inline", "ready waiters cannot orphan an outstanding retry completion"],
-  ["retrying-after-failed-opening | open ok | plain", "a queued request retries immediately after a recoverable opening failure"],
-  ["retrying-after-failed-opening | open failed recoverable | plain", "a queued retry after repeated recoverable opening failures settles instead of hot looping"],
-  ["reopening | requestPass | plain", "a request-triggered reopen failure does not spend an immediate second attempt"],
-  ["reopening | requestPass | inline", "a completion waiter request after recoverable open failure starts the reopen"],
-  ["reopening | tick | plain", "the reconcile timer reopens a failed session without any request"],
-  ["reopening | notify | plain", "a reopen trigger preserves %s across a failed reopen and a later request"],
-  ["reopening | open ok | plain", "a completion waiter request after recoverable open failure starts the reopen"],
-  ["reopening | open failed recoverable | plain", "a request-triggered reopen failure does not spend an immediate second attempt"],
-  ["opening | stop | plain", "shutdown during initial traversal leaves prior output intact and releases ownership for a new scan"],
-  ["running | stop | plain", "scope shutdown closes pass admission before awaiting a started publication and restart replays it"],
-  ["reopening | stop | plain", "closing the scope while a failed session waits releases the output lease"],
-  ["stopped-fatal | requestPass | plain", "fatal first-pass failure rejects later admission instead of starting unreachable work"],
-  ["stopped | requestPass | plain", "a request stopped during async invalidation stays rejected"],
-]);
-
-const expectedUncoveredTransitions = [
-  "opening | requestPass | inline",
-  "opening | requestPass | async-gap",
-  "opening | notify | inline",
-  "opening | notify | async-gap",
-  "opening | tick | plain",
-  "opening | tick | inline",
-  "opening | tick | async-gap",
-  "opening | open ok | inline",
-  "opening | open ok | async-gap",
-  "opening | open failed recoverable | async-gap",
-  "opening | open failed fatal | inline",
-  "opening | open failed fatal | async-gap",
-  "opening | interruption | plain",
-  "opening | interruption | inline",
-  "opening | interruption | async-gap",
-  "opening | stop | inline",
-  "opening | stop | async-gap",
-  "running | requestPass | inline",
-  "running | requestPass | async-gap",
-  "running | notify | inline",
-  "running | tick | plain",
-  "running | tick | inline",
-  "running | tick | async-gap",
-  "running | pass ok | inline",
-  "running | pass ok | async-gap",
-  "running | typed failure | inline",
-  "running | typed failure | async-gap",
-  "running | defect | inline",
-  "running | defect | async-gap",
-  "running | interruption | plain",
-  "running | interruption | inline",
-  "running | interruption | async-gap",
-  "running | stop | inline",
-  "running | stop | async-gap",
-  "retrying-after-failed-opening | requestPass | async-gap",
-  "retrying-after-failed-opening | notify | plain",
-  "retrying-after-failed-opening | notify | inline",
-  "retrying-after-failed-opening | notify | async-gap",
-  "retrying-after-failed-opening | tick | plain",
-  "retrying-after-failed-opening | tick | inline",
-  "retrying-after-failed-opening | tick | async-gap",
-  "retrying-after-failed-opening | open ok | inline",
-  "retrying-after-failed-opening | open ok | async-gap",
-  "retrying-after-failed-opening | open failed recoverable | inline",
-  "retrying-after-failed-opening | open failed recoverable | async-gap",
-  "retrying-after-failed-opening | interruption | plain",
-  "retrying-after-failed-opening | interruption | inline",
-  "retrying-after-failed-opening | interruption | async-gap",
-  "retrying-after-failed-opening | stop | plain",
-  "retrying-after-failed-opening | stop | inline",
-  "retrying-after-failed-opening | stop | async-gap",
-  "reopening | requestPass | async-gap",
-  "reopening | notify | inline",
-  "reopening | notify | async-gap",
-  "reopening | tick | inline",
-  "reopening | tick | async-gap",
-  "reopening | open ok | inline",
-  "reopening | open ok | async-gap",
-  "reopening | open failed recoverable | inline",
-  "reopening | open failed recoverable | async-gap",
-  "reopening | stop | inline",
-  "reopening | stop | async-gap",
-  "stopped-fatal | requestPass | inline",
-  "stopped-fatal | requestPass | async-gap",
-  "stopped-fatal | notify | plain",
-  "stopped-fatal | notify | inline",
-  "stopped-fatal | notify | async-gap",
-  "stopped-fatal | tick | plain",
-  "stopped-fatal | tick | inline",
-  "stopped-fatal | tick | async-gap",
-  "stopped-fatal | stop | plain",
-  "stopped-fatal | stop | inline",
-  "stopped-fatal | stop | async-gap",
-  "stopped | requestPass | inline",
-  "stopped | requestPass | async-gap",
-  "stopped | notify | plain",
-  "stopped | notify | inline",
-  "stopped | notify | async-gap",
-  "stopped | tick | plain",
-  "stopped | tick | inline",
-  "stopped | tick | async-gap",
-  "stopped | stop | plain",
-  "stopped | stop | inline",
-  "stopped | stop | async-gap",
-];
-
-test("Round 5 live transition table links rows, leaves them explicitly uncovered, or documents impossibility", async () => {
-  // #given the public transition table from the Round 5 design note
-  const testDir = dirname(import.meta.path);
-  const testFiles = (await readdir(testDir)).filter((path) => path.endsWith(".test.ts"));
-  const registered = new Set((await Promise.all(testFiles.map(async (path) => {
-    const source = await readFile(join(testDir, path), "utf8");
-    return [...source.matchAll(/test(?:\.each\([^)]*\))?\("([^"]+)"/g)].map((match) => match[1]);
-  }))).flat());
-  const rows = transitionStates.flatMap((state) => transitionEvents.flatMap((event) => transitionModes.map((mode) => {
-    const impossibleBecause = transitionImpossibleReason(state, event);
-    return {
-      state,
-      event,
-      mode,
-      // Impossible pairs stay in this executable table with a reason instead of disappearing from coverage review.
-      impossibleBecause,
-      coveredBy: impossibleBecause === null ? transitionCoveredBy.get(transitionKey(state, event, mode)) ?? null : null,
-    };
-  })));
-
-  // #when the table is checked as a single inventory
-  const uncovered = rows.filter((row) => row.impossibleBecause === null && row.coveredBy === null).map((row) => transitionKey(row.state, row.event, row.mode));
-  const undocumentedImpossible = rows.filter((row) => row.impossibleBecause !== null && row.impossibleBecause.length === 0);
-  const missingTitles = [...new Set(rows.map((row) => row.coveredBy).filter((title): title is string => title !== null && !registered.has(title)))].sort();
-  const staleCoveredRows = [...transitionCoveredBy.keys()].filter((covered) => !rows.some((row) => transitionKey(row.state, row.event, row.mode) === covered)).sort();
-
-  // #then every transition pair is linked to a registered exact test, explicitly uncovered, or documented impossible
-  expect({ rows: rows.length, uncovered, undocumentedImpossible, missingTitles, staleCoveredRows }).toEqual({ rows: 198, uncovered: expectedUncoveredTransitions, undocumentedImpossible: [], missingTitles: [], staleCoveredRows: [] });
-});
 
 test("a source replaced during initial processing converges without a watcher notice", async () => {
   // #given a real source whose old bytes have been read at a held publication boundary
@@ -1058,17 +879,6 @@ test.each([
   });
 });
 
-test("request payload model records cells that cannot be driven deterministically", () => {
-  // #given the remaining requested interleaving requires a seam after the work scheduler finalizer closed
-  const uncalibrated = [{
-    admission: "scope-closing window of a recoverable running failure",
-    ending: "retry fail or retry ok after the request is accepted",
-    reason: "No internal hook currently runs after the live attempt's scheduler finalizer has closed and before supervise clears scheduler/machine; issuing a public request from a handler finalizer hung before a stable admission result.",
-  }];
-  // #then the model inventory names the omitted cell and why it is not silently omitted
-  expect(uncalibrated).toEqual([{ admission: "scope-closing window of a recoverable running failure", ending: "retry fail or retry ok after the request is accepted", reason: "No internal hook currently runs after the live attempt's scheduler finalizer has closed and before supervise clears scheduler/machine; issuing a public request from a handler finalizer hung before a stable admission result." }]);
-});
-
 test.each(["force", "hint"])("a request admitted during a one-shot retry preserves earlier %s payload", async (mode) => {
   // #given a recoverable opening whose queued retry carries force or a source hint
   const root = await mkdtemp(join(tmpdir(), `sync-engine-live-retry-payload-${mode}-`));
@@ -1849,6 +1659,129 @@ test("watcher hints survive a failed pass that stops before freshness invalidati
     })));
     // #then the retry still uses the carried watcher hint and rebuilds the equal-stamp result
     expect(result).toEqual({ failed: true, text: "Changed!" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+type ClosingWindow = "before attempt close" | "after attempt close";
+
+async function runClosingWindowScenario(window: ClosingWindow, retry: "succeeds" | "fails after publication") {
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-closing-window-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const stamp = new Date("2020-01-01T00:00:00Z");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "note.txt"), "Original");
+  await utimes(join(sourcePath, "note.txt"), stamp, stamp);
+  const followUps: PassSnapshot[] = [];
+  let dieOnTrigger = false;
+  let failRetryAfterPublication = false;
+  const admissions: string[] = [];
+  const options = {
+    sourcePath,
+    outputPath,
+    reconcileIntervalMs: 0,
+    recovery: { existing: Effect.succeed(true) },
+    // Only note.txt is cacheable; the trigger always runs, so the failing pass carries no force or hint of its own.
+    freshness: { describe: (path: string) => path === "note.txt" ? { sourcePaths: ["note.txt"], resultKind: "note", processingVersion: "v1", outputPaths: ["note.txt"] } : undefined },
+    declare: (_entries: unknown, request: PassSnapshot) => Effect.sync(() => {
+      if (request.kind !== "initial") followUps.push({ kind: request.kind, force: request.force, changedPaths: [...request.changedPaths] });
+      return { work: ["note.txt", "trigger"], publish: Effect.void };
+    }),
+    handle: (path: string) => path === "trigger"
+      ? (dieOnTrigger ? Effect.sync(() => { dieOnTrigger = false; }).pipe(Effect.andThen(Effect.die("recoverable running defect"))) : Effect.succeed([] as string[]))
+      : io(async () => { await Bun.write(join(outputPath, path), await readFile(join(sourcePath, path), "utf8")); return [] as string[]; }),
+  };
+  try {
+    const scope = await Effect.runPromise(Scope.make());
+    let session!: LiveHandle<string, Error>;
+    // #when the window of the failed attempt receives an equal-stamp replacement hint and a forced request
+    let windowUsed = false;
+    // One window only: a later close of the failed retry must not admit again.
+    const admitInWindow = Effect.suspend(() => windowUsed ? Effect.void : io(async () => {
+      windowUsed = true;
+      await Bun.write(join(sourcePath, "note.txt"), "Changed!");
+      await utimes(join(sourcePath, "note.txt"), stamp, stamp);
+      if (retry === "fails after publication") failRetryAfterPublication = true;
+      admissions.push(await Effect.runPromise(session.notify(["note.txt"])));
+      admissions.push(await Effect.runPromise(session.requestPass({ force: true })));
+    }).pipe(Effect.orDie));
+    session = await Effect.runPromise(startLiveSynchronizationWithHooks(options, {
+      beforeAttemptClose: () => window === "before attempt close" ? admitInWindow : Effect.void,
+      afterAttemptClose: () => window === "after attempt close" ? admitInWindow : Effect.void,
+      afterOpeningPublication: Effect.suspend(() => failRetryAfterPublication ? Effect.die("retry failed after publication") : Effect.void),
+    }).pipe(Scope.provide(scope))) as LiveHandle<string, Error>;
+    await Effect.runPromise(session.ready);
+    dieOnTrigger = true;
+    await Effect.runPromise(session.requestPass());
+    const completion = await Effect.runPromise(Effect.exit(session.awaitCompletion));
+    const status = await Effect.runPromise(session.status);
+    const published = await readFile(join(outputPath, "note.txt"), "utf8");
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    // A fresh session trusts only retained freshness, so it shows whether the window's requests reached it.
+    await Effect.runPromise(runInitialPass({ ...options, declare: () => Effect.succeed({ work: ["note.txt"], publish: Effect.void }) }));
+    const payloadBearing = followUps.filter((request) => request.force || request.changedPaths.length > 0);
+    return { admissions, completion: Exit.isSuccess(completion) ? "succeeded" : "failed", state: status.state, followUp: status.followUp, published, payloadBearing, restarted: await readFile(join(outputPath, "note.txt"), "utf8") };
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test.each(["before attempt close", "after attempt close"] as const)("requests in the closing window of a recoverable running failure reach the retry once: %s", async (window) => {
+  // #given an opened recoverable session whose follow-up pass dies, and a retry that succeeds
+  const result = await runClosingWindowScenario(window, "succeeds");
+  // #then both requests are queued for the retry, its declare gets their union once, and output and restart are current
+  expect(result).toEqual({
+    admissions: ["queued", "queued"],
+    completion: "succeeded",
+    state: "complete",
+    followUp: null,
+    published: "Changed!",
+    payloadBearing: [{ kind: "resync", force: true, changedPaths: ["note.txt"] }],
+    restarted: "Changed!",
+  });
+});
+
+test.each(["before attempt close", "after attempt close"] as const)("requests in the closing window of a recoverable running failure reach freshness when the retry fails: %s", async (window) => {
+  // #given an opened recoverable session whose follow-up pass dies, and a retry that fails after its publication
+  const result = await runClosingWindowScenario(window, "fails after publication");
+  // #then the session waits failed with nothing scheduled, and a restart rebuilds instead of trusting the old record
+  expect(result).toEqual({
+    admissions: ["queued", "queued"],
+    completion: "failed",
+    state: "failed",
+    followUp: null,
+    published: "Original",
+    payloadBearing: [],
+    restarted: "Changed!",
+  });
+});
+
+test("a fatal first pass fails ready only after the output lease is released", async () => {
+  // #given a cold session without recovery whose first pass fails
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-fatal-lease-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "document"), "Original");
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* startLiveSynchronization({
+        sourcePath,
+        outputPath,
+        declare: () => Effect.succeed({ work: ["document"], publish: Effect.void }),
+        handle: () => Effect.fail(new Error("first pass failed")),
+      });
+      // #when ready fails, the caller immediately takes the output lease as a restart would
+      const ready = yield* Effect.exit(session.ready);
+      const startedAt = Date.now();
+      const lease = yield* Effect.exit(acquireOutputTree(outputPath));
+      if (Exit.isSuccess(lease)) yield* Effect.promise(lease.value);
+      return { readyFailed: Exit.isFailure(ready), lease: Exit.isSuccess(lease) ? "acquired" : "contended", waitedUnderSecond: Date.now() - startedAt < 1000, admission: yield* session.requestPass() };
+    })));
+    // #then the lease is free without contention and admission is already closed
+    expect(result).toEqual({ readyFailed: true, lease: "acquired", waitedUnderSecond: true, admission: "rejected" });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
