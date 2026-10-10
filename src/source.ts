@@ -1,7 +1,7 @@
 import { Data, Effect } from "effect";
 import { lstat, readdir, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { SourceEntry } from "./index.ts";
+import type { SourceEntry } from "./initial-pass.ts";
 import { canonicalDestination } from "./ownership.ts";
 
 export interface SourceStat {
