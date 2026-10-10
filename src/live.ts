@@ -1,6 +1,8 @@
 import { Cause, Deferred, Effect, Exit, Fiber, Scope } from "effect";
-import { scanSource, type InitialPass, type InitialPlan, type SourceEntry, type ScanFailed, type OutputOwnershipFailed, type FreshnessFailed } from "./index.ts";
-import { openSynchronizationWithHooks, type InternalSynchronization } from "./internal.ts";
+import { openSynchronizationInternal, type InternalSynchronization } from "./internal.ts";
+import { scanSource, type InitialPass, type InitialPlan, type SourceEntry, type ScanFailed } from "./initial-pass.ts";
+import type { FreshnessFailed } from "./freshness.ts";
+import type { OutputOwnershipFailed } from "./ownership.ts";
 import { INITIAL, init, invalidationTarget, Payload, step, view, type Availability, type Command, type Event, type PassAdmission, type PassRequest, type Session, type Settlement } from "./live-machine.ts";
 import type { WorkStatus } from "./work.ts";
 
@@ -84,7 +86,7 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
  */
 export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<W, E, R>, internal: LiveInternalHooks = {}): Effect.Effect<LiveHandle<W, E | FreshnessFailed | OutputOwnershipFailed>, never, R | Scope.Scope> {
   type Failure = E | FreshnessFailed | ScanFailed | OutputOwnershipFailed;
-  type Live = InternalSynchronization<W, E | FreshnessFailed>;
+  type Live = InternalSynchronization<W, E | FreshnessFailed> & { readonly commitFreshness: Effect.Effect<void, E | FreshnessFailed> };
   interface Attempt {
     readonly scope: Scope.Closeable;
     /** Parent of every later pass's scope. Forked during the initial declaration, so it closes after the scheduler stops and before the lease is released. */
@@ -177,7 +179,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
     const opening = (attempt: number, entry: Attempt): Effect.Effect<void, never, R> => {
       let declaredMinimum = false;
       const body = Effect.gen(function* () {
-        yield* openSynchronizationWithHooks({
+        const opening = yield* openSynchronizationInternal({
           ...options,
           // A plan that declares no minimum has published nothing usable when `onMinimum` runs.
           onMinimum: Effect.suspend(() => declaredMinimum ? report({ tag: "usable", attempt }) : Effect.void).pipe(Effect.andThen(options.onMinimum ?? Effect.void)),
@@ -188,15 +190,13 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
             declaredMinimum = (plan.minimum?.length ?? 0) > 0;
             return plan;
           }),
-        }, {
-          deferCommit: true,
-          beforeCommit: (live) => Effect.gen(function* () {
-            entry.live = live;
-            const { failure } = yield* dispatch({ tag: "freshnessReady", attempt });
-            if (failure !== null) return yield* Effect.failCause(failure);
-            yield* (internal.afterOpeningPublication ?? Effect.void);
-          }),
         }).pipe(Scope.provide(entry.scope));
+        const live: Live = { ...opening.synchronization, commitFreshness: opening.commitFreshness };
+        entry.live = live;
+        const { failure } = yield* dispatch({ tag: "freshnessReady", attempt });
+        if (failure !== null) return yield* Effect.failCause(failure);
+        yield* (internal.afterOpeningPublication ?? Effect.void);
+        yield* opening.commitFreshness;
         // The traversal after the first pass belongs to the open: a change it finds is already due when `ready` settles.
         const afterInitial = yield* scanSource(options.sourcePath, options.includeSource);
         return differences(baseline, afterInitial);
