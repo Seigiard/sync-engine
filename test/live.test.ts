@@ -1867,6 +1867,46 @@ test("a later pass's resources are released only after the scheduler stopped the
   }
 });
 
+test.each([
+  ["defect", () => Effect.die("handler defect")],
+  ["self-interruption", () => Effect.interrupt],
+] as const)("a later pass with null work releases resources only after a handler stops when another worker ends by %s", async (_ending, endWorker) => {
+  // #given two workers: a null handler is still running when the other worker ends the attempt
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-null-pass-order-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  const order: string[] = [];
+  const running = gate();
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* openLiveSynchronization({
+        sourcePath,
+        outputPath,
+        concurrency: 2,
+        reconcileIntervalMs: 0,
+        recovery: { existing: Effect.succeed(true) },
+        declare: (_entries, request) => request.kind === "initial"
+          ? Effect.succeed({ work: [] as Array<string | null>, publish: Effect.void })
+          : Effect.acquireRelease(Effect.void, () => Effect.sync(() => { order.push("pass resource released"); }))
+            .pipe(Effect.as({ work: [null, "ends"] as Array<string | null>, publish: Effect.void })),
+        handle: (work: string | null) => {
+          if (work === null) return Effect.sync(() => running.open()).pipe(Effect.andThen(Effect.never), Effect.onInterrupt(() => Effect.sync(() => { order.push("handler stopped"); })));
+          return Effect.promise(() => running.promise).pipe(Effect.andThen(endWorker()));
+        },
+      });
+      // #when the scheduler ends the attempt while the null handler is in flight
+      yield* session.requestPass();
+      const completion = yield* Effect.exit(session.awaitCompletion);
+      return { failed: Exit.isFailure(completion), order: [...order] };
+    })));
+    // #then the null handler is stopped before the pass resource it may use is released
+    expect(result).toEqual({ failed: true, order: ["handler stopped", "pass resource released"] });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a successful later pass releases its scoped resources when it ends", async () => {
   // #given a healthy session whose later declarations each acquire a scoped resource
   const root = await mkdtemp(join(tmpdir(), "sync-engine-live-pass-release-"));
