@@ -1,5 +1,5 @@
 import { Cause, Deferred, Effect, Exit, Fiber, Scope } from "effect";
-import { openSynchronizationInternal, type InternalSynchronization } from "./internal.ts";
+import { openSynchronizationInternal, type InternalOpening } from "./internal.ts";
 import { scanSource, type InitialPass, type InitialPlan, type SourceEntry, type ScanFailed } from "./initial-pass.ts";
 import type { FreshnessFailed } from "./freshness.ts";
 import type { OutputOwnershipFailed } from "./ownership.ts";
@@ -86,12 +86,11 @@ export function startLiveSynchronization<W, E, R>(options: LiveOptions<W, E, R>)
  */
 export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<W, E, R>, internal: LiveInternalHooks = {}): Effect.Effect<LiveHandle<W, E | FreshnessFailed | OutputOwnershipFailed>, never, R | Scope.Scope> {
   type Failure = E | FreshnessFailed | ScanFailed | OutputOwnershipFailed;
-  type Live = InternalSynchronization<W, E | FreshnessFailed> & { readonly commitFreshness: Effect.Effect<void, E | FreshnessFailed> };
   interface Attempt {
     readonly scope: Scope.Closeable;
     /** Parent of every later pass's scope. Forked during the initial declaration, so it closes after the scheduler stops and before the lease is released. */
     passes?: Scope.Closeable;
-    live?: Live;
+    opening?: InternalOpening<W, E | FreshnessFailed>;
     activity?: Fiber.Fiber<void>;
   }
 
@@ -137,9 +136,9 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
       let failure: Cause.Cause<E | FreshnessFailed> | null = null;
       for (const command of commands) {
         if (command.tag !== "invalidate") continue;
-        const live = attempts.get(command.attempt)?.live;
-        if (live === undefined) continue;
-        const exit = yield* Effect.exit(live.submit([], { force: command.force, changedPaths: command.paths }));
+        const synchronization = attempts.get(command.attempt)?.opening?.synchronization;
+        if (synchronization === undefined) continue;
+        const exit = yield* Effect.exit(synchronization.submit([], { force: command.force, changedPaths: command.paths }));
         if (Exit.isFailure(exit)) failure ??= exit.cause;
       }
       for (const command of commands) {
@@ -191,8 +190,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
             return plan;
           }),
         }).pipe(Scope.provide(entry.scope));
-        const live: Live = { ...opening.synchronization, commitFreshness: opening.commitFreshness };
-        entry.live = live;
+        entry.opening = opening;
         const { failure } = yield* dispatch({ tag: "freshnessReady", attempt });
         if (failure !== null) return yield* Effect.failCause(failure);
         yield* (internal.afterOpeningPublication ?? Effect.void);
@@ -221,19 +219,19 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
       // Set once the pass committed freshness: from then on its payload is applied, whatever fails afterwards.
       let committed = false;
       const steps = Effect.gen(function* () {
-        const live = entry.live!;
+        const synchronization = entry.opening!.synchronization;
         const entries = yield* scanSource(options.sourcePath, options.includeSource);
         const { claimed: declared } = yield* dispatch({ tag: "passClaim", pass, changes: differences(baseline, entries) });
         // Only a stopped session refuses the claim; the pass then declares nothing.
         if (declared === undefined) return yield* Effect.interrupt;
         const plan = yield* options.declare(entries, declared);
-        yield* live.submit(plan.work, declared);
-        yield* live.awaitCompletion;
+        yield* synchronization.submit(plan.work, declared);
+        yield* synchronization.awaitCompletion;
         yield* plan.publish;
-        yield* live.commitFreshness;
+        yield* entry.opening!.commitFreshness;
         committed = true;
         baseline = entries;
-        const outcome = (yield* live.status).state === "complete-with-errors" ? "complete-with-errors" as const : "complete" as const;
+        const outcome = (yield* synchronization.status).state === "complete-with-errors" ? "complete-with-errors" as const : "complete" as const;
         const after = yield* scanSource(options.sourcePath, options.includeSource);
         return { outcome, changes: differences(entries, after) };
       });
@@ -242,7 +240,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
         const exit = yield* Effect.exit(steps.pipe(Scope.provide(scope)));
         // A handler still in flight (another worker died, or the session stops) may use what the pass acquired; the
         // attempt close then releases it once the scheduler's workers stopped. Otherwise the pass releases it now.
-        if ((yield* entry.live!.status).active !== null) return yield* exit;
+        if ((yield* entry.opening!.synchronization.status).active !== null) return yield* exit;
         const closed = yield* Effect.exit(Scope.close(scope, exit));
         if (Exit.isSuccess(closed)) return yield* exit;
         return yield* Effect.failCause(Exit.isFailure(exit) ? Cause.combine(exit.cause, closed.cause) : closed.cause);
@@ -253,7 +251,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
           ? Effect.succeed({ tag: "passOk", pass, ...exit.value })
           // Typed failures keep the attempt; a defect, an interruption or a failed scheduler ends it.
           : Effect.gen(function* () {
-            const schedulerFailed = entry.live !== undefined && (yield* entry.live.status).state === "failed";
+            const schedulerFailed = entry.opening !== undefined && (yield* entry.opening.synchronization.status).state === "failed";
             const endsAttempt = exit.cause.reasons.some((reason) => reason._tag !== "Fail") || schedulerFailed;
             return { tag: "passFail", pass, cause: exit.cause, endsAttempt, discharged: committed } as const;
           }),
@@ -285,10 +283,10 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
     const request = (payload: Payload): Effect.Effect<PassAdmission> => Effect.gen(function* () {
       // Invalidate before the admission step: a commit after admission then cannot record a read older than the hint.
       const target = invalidationTarget(state);
-      const live = target === null ? undefined : attempts.get(target)?.live;
+      const synchronization = target === null ? undefined : attempts.get(target)?.opening?.synchronization;
       let appliedTo: number | null = null;
-      if (live !== undefined && Payload.invalidates(payload)) {
-        const exit = yield* Effect.exit(live.submit([], { force: payload.force, changedPaths: payload.paths }));
+      if (synchronization !== undefined && Payload.invalidates(payload)) {
+        const exit = yield* Effect.exit(synchronization.submit([], { force: payload.force, changedPaths: payload.paths }));
         if (Exit.isSuccess(exit)) appliedTo = target;
       }
       yield* (internal.afterRequestInvalidation ?? Effect.void);
@@ -313,8 +311,8 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
       ready: Effect.suspend(() => Deferred.await(ready)),
       status: Effect.suspend(() => {
         const current = view(state);
-        const live = current.work.attempt === null ? undefined : attempts.get(current.work.attempt)?.live;
-        const work: Effect.Effect<WorkStatus<W>> = live !== undefined ? live.status : Effect.succeed({ state: current.work.fallback, pending: 0, active: null, errors: [] });
+        const synchronization = current.work.attempt === null ? undefined : attempts.get(current.work.attempt)?.opening?.synchronization;
+        const work: Effect.Effect<WorkStatus<W>> = synchronization !== undefined ? synchronization.status : Effect.succeed({ state: current.work.fallback, pending: 0, active: null, errors: [] });
         return work.pipe(Effect.map((work) => ({ state: current.state, pass: current.pass, followUp: current.followUp, failure: current.failure, availability: current.availability, work })));
       }),
     };

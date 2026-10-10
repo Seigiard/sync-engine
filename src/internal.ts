@@ -6,13 +6,9 @@ import { openFreshness, type FreshnessFailed } from "./freshness.ts";
 import { scanSource, ScanFailed, type InitialPass, type Synchronization } from "./initial-pass.ts";
 import { createWorkScheduler } from "./work.ts";
 
-export interface InternalSynchronization<W, E> extends Synchronization<W, E> {
-  /** Drains subsequent work without committing freshness. */
-  readonly awaitCompletion: Effect.Effect<void, E>;
-}
-
 export interface InternalOpening<W, E> {
-  readonly synchronization: InternalSynchronization<W, E>;
+  /** Its awaitCompletion drains subsequent work without committing freshness. */
+  readonly synchronization: Synchronization<W, E>;
   readonly commitFreshness: Effect.Effect<void, E>;
 }
 
@@ -79,7 +75,7 @@ export function openSynchronizationInternal<W, E, R>(options: InitialPass<W, E, 
     const completed = yield* scheduler.status;
     if (completed.errors.length > 0) return yield* Effect.failCause(completed.errors[0]!.cause);
     const commitFreshness = trackFreshness(freshness.commit);
-    const synchronization: InternalSynchronization<W, E | FreshnessFailed> = {
+    const synchronization: Synchronization<W, E | FreshnessFailed> = {
       ...scheduler,
       submit: (work, input) => Effect.suspend(() => closed ? Effect.interrupt : trackFreshness(input === undefined ? freshness.invalidateWork(work) : freshness.invalidate(input)).pipe(Effect.andThen(scheduler.submit(work)))),
       awaitCompletion: Effect.suspend(() => closed ? Effect.interrupt : scheduler.awaitCompletion),
