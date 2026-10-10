@@ -240,8 +240,8 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
       const body = Effect.gen(function* () {
         const scope = yield* Scope.fork(entry.passes!);
         const exit = yield* Effect.exit(steps.pipe(Scope.provide(scope)));
-        // A non-terminal scheduler may still have handlers using what the pass acquired; the attempt close then
-        // releases it once the scheduler's workers stopped. Otherwise the pass releases it now.
+        // Only a drained scheduler proves that no worker still uses pass resources. Failed or stopped states may
+        // still have workers awaiting cleanup, so defer release to attempt close; otherwise release the pass now.
         const status = yield* entry.live!.status;
         if (status.state !== "complete" && status.state !== "complete-with-errors") return yield* exit;
         const closed = yield* Effect.exit(Scope.close(scope, exit));
