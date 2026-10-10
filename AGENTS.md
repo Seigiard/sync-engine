@@ -25,6 +25,8 @@ Manual checks:
 - `bun test/shared-mount-check.ts` runs on the host and drives containers that share one volume, to prove the lease holds across containers. It uses the compose image `${COMPOSE_PROJECT_NAME}-engine-test` (default project `opds49-52`); build the image under the same project name first.
 - `bun scripts/verify-pack.ts` verifies the packed tarball from a clean checkout. Run it before a release.
 
+Before changing publication or releasing a version, read `docs/releases.md` for the staged-publishing procedure and its verification criteria.
+
 ## Architecture
 
 - `src/index.ts` is the public entry. `openSynchronization` composes the internal opening with its initial freshness commit, while `runInitialPass` scopes it. It builds on `ownership.ts` (lease, state area), `work.ts` (scheduler) and `freshness.ts` (retained results), and re-exports `source.ts` (observation, output cleanup).

@@ -279,3 +279,8 @@ work through successful-only freshness. A write without recorded success is
 eligible for replay; application handlers must tolerate that replay. Cooperative
 shutdown preserves the handler's declared boundary, not atomic safety against
 SIGKILL, a shutdown deadline, or power loss at every intermediate write.
+
+## Releases
+
+The package is staged from a clean CI job without project dependencies, then approved by a maintainer with npm 2FA.
+For publication setup, archive verification, or a version release, follow the [release procedure](https://github.com/Seigiard/sync-engine/blob/main/docs/releases.md).
