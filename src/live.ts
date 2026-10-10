@@ -149,7 +149,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
     const report = (event: Event<Cause.Cause<Failure>>): Effect.Effect<void> => dispatch(event).pipe(Effect.asVoid);
 
     /**
-     * The one way an activity fiber (opening, pass or close) ends. Its body runs interruptibly under `Effect.exit`,
+     * The one way an opening or close activity fiber ends. Its body runs interruptibly under `Effect.exit`,
      * so success, typed failure, defect, interruption, a failing finalizer the body awaits and a failing trailing
      * step all become an exit. `outcome` turns that exit into exactly one event; if `outcome` itself fails, the pure
      * `fallback` supplies the event. The dispatch then runs uninterruptibly, so no exit path can skip it.
@@ -205,9 +205,8 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
 
     const runPass = (attempt: number, pass: number): Effect.Effect<void, never, R> => {
       const entry = attempts.get(attempt)!;
-      return Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
-        const result = yield* restore(runLaterActivity({
-          pass,
+      return Effect.uninterruptibleMask(() => Effect.gen(function* () {
+        const result = yield* runLaterActivity({
           baseline,
           sourcePath: options.sourcePath,
           includeSource: options.includeSource,
@@ -216,7 +215,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
           commitFreshness: entry.opening!.commitFreshness,
           claim: (changes) => dispatch({ tag: "passClaim", pass, changes }).pipe(Effect.map(({ claimed }) => claimed)),
           declare: options.declare,
-        }));
+        });
         baseline = result.baseline;
         if (result.tag === "ok") {
           yield* report({ tag: "passOk", pass, outcome: result.outcome, changes: result.changes });

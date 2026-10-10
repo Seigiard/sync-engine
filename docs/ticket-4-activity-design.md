@@ -54,7 +54,6 @@ The accepted interface is the typed Effect activity in
 
 ```ts
 runLaterActivity({
-  pass,
   baseline,
   sourcePath,
   includeSource,
@@ -89,6 +88,15 @@ the caller no longer chooses when to claim. The caller only stores the returned
 baseline and turns the discriminated result into the existing `passOk` or
 `passFail` event (`src/live.ts:206-227`). This is result delivery, not a second
 progress protocol.
+
+The handoff keeps one uninterruptible region from result receipt through event
+delivery. `runPass` enters `Effect.uninterruptibleMask` and calls
+`runLaterActivity` without `restore`; the activity makes only its body
+interruptible with `Effect.exit(Effect.interruptible(body))`. It then returns
+the complete result, and `runPass` advances `baseline` and reports exactly one
+event in the same outer region. A pending interrupt can therefore interrupt
+the body and become the owned failure cause, but cannot escape between result
+construction and `passOk`/`passFail` delivery.
 
 ## Obligation Comparison
 

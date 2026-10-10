@@ -4,7 +4,6 @@ import type { FreshnessFailed } from "./freshness.ts";
 import type { PassRequest } from "./live-machine.ts";
 
 export interface LaterActivityOptions<W, E, R> {
-  readonly pass: number;
   readonly baseline: readonly SourceEntry[];
   readonly sourcePath: string;
   readonly includeSource?: (relativePath: string) => boolean;
@@ -15,6 +14,10 @@ export interface LaterActivityOptions<W, E, R> {
   readonly declare: (entries: readonly SourceEntry[], request: PassRequest) => Effect.Effect<InitialPlan<W, E, R>, E, R>;
 }
 
+/**
+ * Complete result of a later pass. `discharged` means the freshness commit
+ * completed; `baseline` is the source snapshot advanced by that commit.
+ */
 export type LaterActivityResult<E> =
   | {
     readonly tag: "ok";
@@ -43,12 +46,14 @@ export function differences(before: readonly SourceEntry[], after: readonly Sour
 }
 
 export function runLaterActivity<W, E, R>(options: LaterActivityOptions<W, E, R>): Effect.Effect<LaterActivityResult<E>, never, R> {
-  return Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+  return Effect.gen(function* () {
+    // Set once the pass committed freshness: from then on its payload is applied, whatever fails afterwards.
     let committed = false;
     let baseline = options.baseline;
     const steps = Effect.gen(function* () {
       const entries = yield* scanSource(options.sourcePath, options.includeSource);
       const declared = yield* options.claim(differences(baseline, entries));
+      // Only a stopped session refuses the claim; the pass then declares nothing.
       if (declared === undefined) return yield* Effect.interrupt;
       const plan = yield* options.declare(entries, declared);
       yield* options.synchronization.submit(plan.work, declared);
@@ -64,16 +69,19 @@ export function runLaterActivity<W, E, R>(options: LaterActivityOptions<W, E, R>
     const body = Effect.gen(function* () {
       const scope = yield* Scope.fork(options.passParent);
       const exit = yield* Effect.exit(steps.pipe(Scope.provide(scope)));
+      // Only a drained scheduler proves that no worker still uses pass resources. Failed or stopped states may
+      // still have workers awaiting cleanup, so defer release to attempt close; otherwise release the pass now.
       const status = yield* options.synchronization.status;
       if (status.state !== "complete" && status.state !== "complete-with-errors") return yield* exit;
       const closed = yield* Effect.exit(Scope.close(scope, exit));
       if (Exit.isSuccess(closed)) return yield* exit;
       return yield* Effect.failCause(Exit.isFailure(exit) ? Cause.combine(exit.cause, closed.cause) : closed.cause);
     });
-    const exit = yield* Effect.exit(restore(body));
+    const exit = yield* Effect.exit(Effect.interruptible(body));
     if (Exit.isSuccess(exit)) return { tag: "ok", ...exit.value, baseline };
 
     const status = yield* options.synchronization.status;
+    // Typed failures keep the attempt; a defect, an interruption or a failed scheduler ends it.
     const endsAttempt = exit.cause.reasons.some((reason) => reason._tag !== "Fail") || status.state === "failed";
     return {
       tag: "fail",
@@ -82,5 +90,5 @@ export function runLaterActivity<W, E, R>(options: LaterActivityOptions<W, E, R>
       discharged: committed,
       baseline,
     };
-  }));
+  });
 }
