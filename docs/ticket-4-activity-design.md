@@ -1,6 +1,10 @@
 # Ticket 4 Activity Design Review
 
-Decision: **no-go** for a new complete activity module.
+Decision: **go**. The complete later-pass activity has been implemented in
+`src/live-activity.ts`. The public API and the live reducer contract are
+unchanged.
+
+## Baseline
 
 The merged step-1 implementation is the baseline. It gives callers a typed
 two-phase opening without adding a public API:
@@ -14,204 +18,217 @@ interface InternalOpening<W, E> {
 
 `openSynchronizationInternal` owns validation, the lease, source scan,
 declaration, minimum and required work, and publication. It returns before the
-freshness commit so live code can preserve the opening invalidation window.
-`openSynchronization` composes the initial commit, and its public
-`awaitCompletion` composes later scheduler completion with that commit. See
-`src/internal.ts:9-16,41-85` and `src/index.ts:13-27`.
+freshness commit so the live caller can preserve the opening invalidation
+window (`src/internal.ts:15-16, 41-84`, `src/live.ts:167-195`). The public
+opening composes the initial commit and later completion in `src/index.ts`.
 
 ## Before Interface
 
-The public initial caller has one explicit composition:
+At the baseline, the live interpreter had two activities. The opening kept its
+special freshness window and failure policy. A later pass assembled this
+sequence in `runPass` (`8ae7862^:src/live.ts:217-261`):
 
 ```text
-openSynchronizationInternal(options)
+leading source scan and differences
+  -> passClaim
+  -> declare
+  -> submit and awaitCompletion
+  -> publish
   -> commitFreshness
-  -> return synchronization with awaitCompletion + commitFreshness
-```
-
-The live caller has two deliberately different activities.
-
-```text
-opening:
-  openSynchronizationInternal(wrapped options)
-  -> dispatch freshnessReady
-  -> afterOpeningPublication hook
-  -> commitFreshness
+  -> set committed and advance baseline
   -> trailing source scan
-  -> openOk/openFail
-
-later pass:
-  leading source scan and differences
-  -> dispatch passClaim
-  -> options.declare(entries, request)
-  -> synchronization.submit(work, request)
-  -> synchronization.awaitCompletion
-  -> plan.publish
-  -> commitFreshness
-  -> record committed progress and baseline
-  -> trailing source scan
-  -> passOk/passFail
+  -> close a drained pass scope
+  -> classify pass failure and discharged progress
 ```
 
-This sequence is visible in `src/live.ts:178-207` and `217-261`. The live
-interpreter also owns the pass child scope and the attempt scope. It releases a
-pass scope only after a drained scheduler, and defers it to attempt close when
-handlers may still be running (`src/live.ts:238-247`).
+The caller also had to combine a pass-scope close cause with the activity
+cause. If the scheduler had not drained, it had to leave that scope for
+attempt close so handlers could finish before resources were released.
+Admission, invalidation, attempt close, retry, and settlement were already
+session responsibilities and remain so.
 
-## Candidate Interfaces
+## Candidate B
 
-### Candidate A: three-call helper
-
-```ts
-runPublishedPass(synchronization, plan): Effect<CommitResult, E>
-```
-
-This can hide `submit`, `awaitCompletion`, `publish`, and `commitFreshness`,
-but it cannot own the leading scan, reducer claim, baseline update, trailing
-scan, scope close, failure classification, or `discharged` result. The live
-caller would still assemble the protocol and keep the difficult obligations.
-This fails the ticket gate explicitly.
-
-### Candidate B: complete later activity
-
-The smallest interface that could own the later sequence would be equivalent
-to:
+The accepted interface is the typed Effect activity in
+`src/live-activity.ts:6-16, 18-31, 45-85`:
 
 ```ts
 runLaterActivity({
-  attempt,
   pass,
   baseline,
+  sourcePath,
+  includeSource,
+  passParent,
   synchronization,
-  passScope,
-  scanSource,
-  claim: (changes) => Effect<PassRequest | undefined>,
-  declare: (entries, request) => Effect<InitialPlan<W, E, R>>,
-}): Effect<
-  | { tag: "ok"; outcome: "complete" | "complete-with-errors"; changes: readonly string[] }
-  | { tag: "fail"; cause: Cause.Cause<Failure>; endsAttempt: boolean; discharged: boolean }
->
+  commitFreshness,
+  claim,
+  declare,
+}): Effect<LaterActivityResult<E>>
 ```
 
-This does move the central sequence and can return commit progress. It does
-not remove caller knowledge: `claim` is the reducer's admission handshake,
-`baseline` is live-session state, and `passScope` is owned by the attempt.
-The caller must still decide when to dispatch `passClaim`, how to map the
-result to `passOk`/`passFail`, when to close the scope, and how to combine a
-cleanup cause with the activity cause. Making those decisions callbacks or
-acknowledgements recreates the existing protocol behind a new name.
+The module owns the complete later sequence:
 
-### Candidate C: one opening/later activity interface
+- leading scan and source differences;
+- the claim point, immediately after that scan and before declaration;
+- declaration, work submission, scheduler drain, publication and freshness commit;
+- baseline advance before the trailing scan;
+- trailing scan and its source differences;
+- pass-scope fork and close when the scheduler is drained;
+- combined pass-scope cleanup causes;
+- `endsAttempt` classification and the `discharged` commit receipt;
+- the complete success or failure result, including the advanced baseline.
 
-```ts
-runActivity({ mode: "opening" | "later", ... }): Effect<OpeningResult | PassResult>
-```
+The module leaves a pass scope open when the scheduler is failed or stopped.
+`closeAttempt` then closes the attempt scope after the activity fiber has
+joined (`src/live.ts:234-247`). This preserves handler lifetime while keeping
+pass-scope cleanup inside the activity for every drained pass.
 
-This can hide more lines, but it adds a mode, a result union, and mode-specific
-callbacks for minimum readiness, opening freshness, pass claim, publication
-policy, and retry classification. Opening and later activities intentionally
-have different failure policies, so the interface encodes rather than removes
-the distinction. It also has to accept attempt cleanup ownership or move it
-into the module, which would risk releasing resources while scheduler workers
-still use them.
+The session supplies one callback because the pure reducer owns admission and
+claim state. The callback is invoked by the activity at its fixed claim point;
+the caller no longer chooses when to claim. The caller only stores the returned
+baseline and turns the discriminated result into the existing `passOk` or
+`passFail` event (`src/live.ts:206-227`). This is result delivery, not a second
+progress protocol.
 
-No candidate therefore satisfies the gate requirement: the live interpreter
-does not stop knowing the ordering, reducer handshake, commit progress,
-invalidation boundary, and lifetime boundary at the same time.
+## Obligation Comparison
 
-## Obligation Inventory
+### Removed from the live caller
 
-Current live caller knowledge:
+- drain, publication and freshness-commit ordering;
+- the mutable `committed` flag and its propagation through trailing scan and
+  pass-scope cleanup;
+- leading and trailing source-difference calculations;
+- pass-scope fork, drained-status check, close and pass-cause joining;
+- pass failure classification, including scheduler failure and interruption;
+- construction of the complete later activity result.
 
-- opening minimum readiness and the `freshnessReady` invalidation handshake;
-- later claim timing, including the claim after leading scan and before
-  declaration;
-- drain, publication, freshness commit, baseline advance, and trailing scan
-  order;
-- initial failure policy versus later typed-handler failure policy;
-- commit progress (`committed`) and the resulting request discharge;
-- pre-admission invalidation target and retarget after the admission gap;
-- pass scope and attempt scope ownership, including cleanup cause joining;
-- activity outcome mapping and completion/ready settlement ordering.
+### Retained session obligations
 
-Candidate B removes local statements for the central sequence, but adds or
-retains knowledge as `claim`, `baseline`, `passScope`, an activity result
-discriminant, and cleanup/result mapping. Candidate C adds `mode` and more
-callbacks. Candidate A removes only three calls. These are not a net
-reduction in caller obligations.
+- admission and reducer state, including the claim callback's reducer event;
+- the baseline as live session state, updated from the activity result;
+- pre-admission invalidation and retargeting;
+- attempt identity, attempt-scope ownership and `attemptClosed` handling;
+- retry, follow-up payload retention and waiter settlement;
+- session shutdown and output-lease finalization.
+
+These facts are retained by the ticket. They are not added obligations of the
+activity interface.
+
+### Truly added interface obligations
+
+- one typed `claim(changes)` callback, required to cross from the activity into
+  the pure reducer at the existing claim point;
+- one result discriminant with the existing success/failure fields and the
+  baseline receipt.
+
+There is no opening/later mode, configurable order callback, acknowledgement,
+checkpoint command, or separate progress machine. The callback does not expose
+timing to the caller, and the result does not require the caller to infer
+whether commit completed. The removed ordering and progress obligations are
+larger than these two typed values, so Candidate B passes the ticket's
+two-part gate.
 
 ## Required Path Traces
 
 ### Failed publication
 
-For the initial activity, `plan.publish` runs after successful required work
-and before the opening result is returned (`src/internal.ts:66-84`). A typed
-failure prevents the opening from returning and therefore prevents its commit;
-the live interpreter maps it to `openFail` (`src/live.ts:202-206`). For a later
-pass, publication runs before commit (`src/live.ts:227-232`). A typed
-publication failure leaves `committed === false`, produces `passFail`, and
-keeps the payload owed (`src/live.ts:251-260`, `src/live-machine.ts:311-324`).
-One shared activity interface would need an explicit initial/later policy
-mode.
+Initial publication remains in `openSynchronizationInternal` after required
+work (`src/internal.ts:66-84`). A typed publication failure prevents the
+opening result and its commit from being returned; the live interpreter emits
+`openFail` (`src/live.ts:170-195`).
+
+For a later pass, Candidate B runs publication before freshness commit
+(`src/live-activity.ts:53-58`). A typed publication failure leaves
+`discharged` false and returns `passFail`; the reducer retains the pass payload
+(`src/live-machine.ts:311-324`). No shared opening/later policy was introduced.
 
 ### Opening invalidation
 
-After the opening publication, live dispatches `freshnessReady`, runs the
-opening hook, and only then commits (`src/live.ts:194-200`). A request in that
-window invalidates the opening synchronization before admission
-(`src/live.ts:284-295`); the reducer also sends every owed invalidation to the
-opening before its commit (`src/live-machine.ts:267-271`). Hiding the opening
-sequence behind an uninterruptible activity would require an invalidation
-callback/acknowledgement and would recreate this handshake.
+The opening still dispatches `freshnessReady`, then runs the opening hook, then
+commits freshness (`src/live.ts:182-189`). The reducer sends every owed
+invalidation to that opening before the commit (`src/live-machine.ts:267-271`).
+The activity extraction does not wrap or move this handshake.
 
 ### Target change during admission
 
-The request path captures the target before invalidation, pauses in the
-admission gap, then dispatches the request with `appliedTo`
-(`src/live.ts:284-295`). If the target changes, the reducer emits a retarget
-command (`src/live-machine.ts:193-212`), and `execute` applies it to the new
-attempt (`src/live.ts:129-151`). This concurrent invalidation must stay
-outside the sequential activity command path. The retained regression in
-commit `46b3695` (cherry-picked from `2278b9e`) proves that omitting retarget
-causes restart output `Original` instead of the required `Changed!`; its
-isolated mutant was red on that exact assertion.
+The request path captures the invalidation target, invalidates it before
+admission, pauses at the existing hook, and dispatches with `appliedTo`
+(`src/live.ts:250-261`). If the target changes, `admit` emits a retarget command
+to the replacement attempt (`src/live-machine.ts:193-212`). This remains
+outside the sequential activity module.
+
+The reachable regression commit `46b3695` retains
+`a delayed watcher invalidation retargets a replacement opening before restart`
+in `test/live.test.ts`. Its isolated omission calibration produced `Original`
+instead of the independent restart oracle's `Changed!`; the baseline test is
+green and remains preservation evidence, not a new missing-behavior lock.
 
 ### Commit followed by trailing traversal failure
 
-The later pass sets `committed = true` immediately after freshness commit and
-before the trailing scan (`src/live.ts:230-236`). A trailing scan failure
-therefore reports `discharged: true` (`src/live.ts:251-260`), and the reducer
-does not re-owe that payload (`src/live-machine.ts:311-315`). The initial
-trailing scan is different: it belongs to opening and maps to `openFail`, so
-the opening can fail after publication and commit (`src/live.ts:197-205`). A
-complete result must preserve this distinction and commit progress, not just
-return a generic error.
+Candidate B sets its local commit receipt immediately after freshness commit,
+advances the returned baseline, and only then scans the source
+(`src/live-activity.ts:57-62`). A trailing scan failure returns `passFail` with
+`discharged: true` (`src/live-activity.ts:74-84`). The reducer therefore does
+not re-owe that payload (`src/live-machine.ts:311-315`).
 
-### Cleanup failure after commit
+The opening trailing scan remains different: it belongs to the opening and
+maps to `openFail`, even if opening publication and commit already completed
+(`src/live.ts:186-195`).
 
-The pass body closes its child scope only when the scheduler is complete. A
-failed or stopped scheduler defers that scope to attempt close, because a
-handler can still be using its resources (`src/live.ts:238-247`). Attempt
-close waits for the activity, closes the attempt scope, and combines a close
-failure with the activity cause (`src/live.ts:268-281`). Moving scope close
-into a lexical activity module either releases resources too early or requires
-the module to accept the same parent scope, status check, and cleanup
-acknowledgements.
+### Drained pass-scope cleanup failure after commit
+
+When the scheduler is drained, Candidate B closes the pass scope after the
+activity exit. A close failure is combined with the activity cause before the
+result is built (`src/live-activity.ts:64-71`). If commit already completed,
+the result still carries `discharged: true` and the advanced baseline. The
+caller emits `passFail`; the reducer does not re-owe the request
+(`src/live-machine.ts:311-315`). A typed close cause can keep the attempt;
+an interruption, defect, or failed scheduler sets `endsAttempt` and enters
+the existing attempt-close path.
+
+This is distinct from `attemptClosed`. When a failed or stopped scheduler has
+not drained, the activity deliberately leaves the child pass scope attached
+to its parent. `closeAttempt` first joins the activity, then closes the attempt
+scope and combines any attempt-finalizer cause into `attemptClosed`
+(`src/live.ts:234-247`). The reducer applies that cause to retry and settlement
+(`src/live-machine.ts:327-347`). Thus pass-scope cleanup and attempt-scope
+cleanup do not overwrite commit progress or each other.
 
 ### Handler still using pass resources
 
-`entry.passes` is forked during initial declaration before scheduler workers
-start (`src/live.ts:185-190`). On later failure, finalization stops activity
-workers before the attempt scope releases the pass resource
-(`src/live.ts:298-305`). Existing runtime tests assert handler-stop before
-resource-release in `test/live.test.ts:1831-1908`. This lifetime boundary is
-session/attempt ownership, not a self-contained pass activity.
+The pass parent is forked during initial declaration before the scheduler is
+created (`src/live.ts:174-181`, `src/internal.ts:42-45`). If a worker dies,
+Candidate B observes the failed scheduler and does not close the pass child
+scope. `closeAttempt` waits for the activity, and reverse finalization of the
+attempt scope stops scheduler workers before releasing the earlier-registered
+pass resource (`src/live.ts:234-247`). The session-shutdown finalizers at
+`src/live.ts:264-271` are a separate outer-scope path and are not used as the
+mechanism for a failed attempt.
 
-## Result
+The independent tests
+`a later pass's resources are released only after the scheduler stopped the
+handlers still using them` and
+`a later pass with null work releases resources only after a handler stops when
+another worker ends by defect` remain in `test/live.test.ts:1906-1983`.
 
-The step-1 `InternalOpening` is retained unchanged. No new production
-abstraction is landed. The independently calibrated retarget regression is
-retained as behavior-preservation evidence, not presented as a missing
-baseline behavior or a first test lock. Existing public tests remain the
-behavior owners for publication, freshness, settlement, and resource
-lifetime.
+## Compatibility And Verification
+
+The reducer still owns admission, payload merging, attempt/pass identity,
+invalidation, retry, follow-up, ready/completion settlement and shutdown. The
+opening still owns minimum work, `onMinimum`, initial failure policy and its
+invalidation window. No public signatures, errors or README behavior changed.
+
+Checks completed for this implementation:
+
+- `docker compose -f docker-compose.test.yml run --rm engine-test bun test test/live.test.ts`: **pass**, 58 pass, 0 fail.
+- `docker compose -f docker-compose.test.yml run --rm --build engine-test`: **pass**, lint 0 warnings/0 errors, typecheck pass, 157 pass, 0 fail.
+- `docker compose -f docker-compose.test.yml run --rm engine-test bun test test/shutdown.test.ts`: **pass**, 2 pass, 0 fail.
+- `git diff --check`: **pass**.
+- `bun run lint`: not available on host because `oxlint` is not installed; Docker lint is the repository check.
+- `bun run typecheck`: not available on host because `@types/bun` is not installed; Docker typecheck is the repository check.
+- `bun scripts/calibrate-live-model.ts --dry-run`: not applicable; `src/live-machine.ts` was unchanged.
+
+The full Docker check includes the bounded live model and all runtime
+fault/lifetime tests. The shutdown test was also run after the implementation
+was corrected to keep the activity body interruptible while preserving
+uninterruptible result delivery.
