@@ -1,6 +1,7 @@
 import { Cause, Deferred, Effect, Exit, Fiber, Scope } from "effect";
 import { openSynchronizationInternal, type InternalOpening } from "./internal.ts";
 import { scanSource, type InitialPass, type InitialPlan, type SourceEntry, type ScanFailed } from "./initial-pass.ts";
+import { differences, runLaterActivity } from "./live-activity.ts";
 import type { FreshnessFailed } from "./freshness.ts";
 import type { OutputOwnershipFailed } from "./ownership.ts";
 import { INITIAL, init, invalidationTarget, Payload, step, view, type Availability, type Command, type Event, type PassAdmission, type PassRequest, type Session, type Settlement } from "./live-machine.ts";
@@ -58,18 +59,6 @@ export interface LiveHandle<W, E> extends LiveSynchronization<W, E> {
    * (see `LiveOptions.recovery`), and fails with the pass cause otherwise.
    */
   readonly ready: Effect.Effect<void, E | ScanFailed>;
-}
-
-function differences(before: readonly SourceEntry[], after: readonly SourceEntry[]): string[] {
-  const previous = new Map(before.map((entry) => [entry.path, entry]));
-  const changed = new Set<string>();
-  for (const entry of after) {
-    const old = previous.get(entry.path);
-    if (!old || old.kind !== entry.kind || (entry.kind === "file" && (old.size !== entry.size || old.mtimeMs !== entry.mtimeMs))) changed.add(entry.path);
-    previous.delete(entry.path);
-  }
-  for (const path of previous.keys()) changed.add(path);
-  return [...changed];
 }
 
 /**
@@ -160,7 +149,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
     const report = (event: Event<Cause.Cause<Failure>>): Effect.Effect<void> => dispatch(event).pipe(Effect.asVoid);
 
     /**
-     * The one way an activity fiber (opening, pass or close) ends. Its body runs interruptibly under `Effect.exit`,
+     * The one way an opening or close activity fiber ends. Its body runs interruptibly under `Effect.exit`,
      * so success, typed failure, defect, interruption, a failing finalizer the body awaits and a failing trailing
      * step all become an exit. `outcome` turns that exit into exactly one event; if `outcome` itself fails, the pure
      * `fallback` supplies the event. The dispatch then runs uninterruptibly, so no exit path can skip it.
@@ -216,48 +205,24 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
 
     const runPass = (attempt: number, pass: number): Effect.Effect<void, never, R> => {
       const entry = attempts.get(attempt)!;
-      // Set once the pass committed freshness: from then on its payload is applied, whatever fails afterwards.
-      let committed = false;
-      const steps = Effect.gen(function* () {
-        const synchronization = entry.opening!.synchronization;
-        const entries = yield* scanSource(options.sourcePath, options.includeSource);
-        const { claimed: declared } = yield* dispatch({ tag: "passClaim", pass, changes: differences(baseline, entries) });
-        // Only a stopped session refuses the claim; the pass then declares nothing.
-        if (declared === undefined) return yield* Effect.interrupt;
-        const plan = yield* options.declare(entries, declared);
-        yield* synchronization.submit(plan.work, declared);
-        yield* synchronization.awaitCompletion;
-        yield* plan.publish;
-        yield* entry.opening!.commitFreshness;
-        committed = true;
-        baseline = entries;
-        const outcome = (yield* synchronization.status).state === "complete-with-errors" ? "complete-with-errors" as const : "complete" as const;
-        const after = yield* scanSource(options.sourcePath, options.includeSource);
-        return { outcome, changes: differences(entries, after) };
-      });
-      const body = Effect.gen(function* () {
-        const scope = yield* Scope.fork(entry.passes!);
-        const exit = yield* Effect.exit(steps.pipe(Scope.provide(scope)));
-        // Only a drained scheduler proves that no worker still uses pass resources. Failed or stopped states may
-        // still have workers awaiting cleanup, so defer release to attempt close; otherwise release the pass now.
-        const status = yield* entry.opening!.synchronization.status;
-        if (status.state !== "complete" && status.state !== "complete-with-errors") return yield* exit;
-        const closed = yield* Effect.exit(Scope.close(scope, exit));
-        if (Exit.isSuccess(closed)) return yield* exit;
-        return yield* Effect.failCause(Exit.isFailure(exit) ? Cause.combine(exit.cause, closed.cause) : closed.cause);
-      });
-      return activity(
-        body,
-        (exit) => Exit.isSuccess(exit)
-          ? Effect.succeed({ tag: "passOk", pass, ...exit.value })
-          // Typed failures keep the attempt; a defect, an interruption or a failed scheduler ends it.
-          : Effect.gen(function* () {
-            const schedulerFailed = entry.opening !== undefined && (yield* entry.opening.synchronization.status).state === "failed";
-            const endsAttempt = exit.cause.reasons.some((reason) => reason._tag !== "Fail") || schedulerFailed;
-            return { tag: "passFail", pass, cause: exit.cause, endsAttempt, discharged: committed } as const;
-          }),
-        (cause) => ({ tag: "passFail", pass, cause: cause as Cause.Cause<Failure>, endsAttempt: true, discharged: committed }),
-      );
+      return Effect.uninterruptibleMask(() => Effect.gen(function* () {
+        const result = yield* runLaterActivity({
+          baseline,
+          sourcePath: options.sourcePath,
+          includeSource: options.includeSource,
+          passParent: entry.passes!,
+          synchronization: entry.opening!.synchronization,
+          commitFreshness: entry.opening!.commitFreshness,
+          claim: (changes) => dispatch({ tag: "passClaim", pass, changes }).pipe(Effect.map(({ claimed }) => claimed)),
+          declare: options.declare,
+        });
+        baseline = result.baseline;
+        if (result.tag === "ok") {
+          yield* report({ tag: "passOk", pass, outcome: result.outcome, changes: result.changes });
+        } else {
+          yield* report({ tag: "passFail", pass, cause: result.cause as Cause.Cause<Failure>, endsAttempt: result.endsAttempt, discharged: result.discharged });
+        }
+      }));
     };
 
     const startPass = (attempt: number, pass: number): Effect.Effect<void> => Effect.gen(function* () {
