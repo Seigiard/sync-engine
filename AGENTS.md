@@ -20,6 +20,8 @@ Compose bind-mounts `src`, `test`, `scripts`, `tsconfig.json` and `bunfig.toml`;
 
 Host-safe, after `bun install`: `bun run lint`, `bun run typecheck`. The model check is the one test free of `flock`, and the calibration baseline runs it on the host: `bun scripts/calibrate-live-model.ts --only none`.
 
+`bun install` installs Lefthook from `lefthook.yml` in Git checkouts. Before commit, it lints staged code with Oxlint, re-stages fixes, and runs the full typecheck when TypeScript is staged. Installs without `.git`, including Docker builds and published-package installs, skip hook setup. The full test suite uses the Docker commands above.
+
 Manual checks:
 
 - `bun test/shared-mount-check.ts` runs on the host and drives containers that share one volume, to prove the lease holds across containers. It uses the compose image `${COMPOSE_PROJECT_NAME}-engine-test` (default project `opds49-52`); build the image under the same project name first.
