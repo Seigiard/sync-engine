@@ -8,6 +8,19 @@ Repository identity: `Seigiard/sync-engine`.
 The library owns synchronization mechanisms. Applications own domain processing and publication requirements.
 Bun on Linux/Docker and Effect 4 are the supported execution boundary.
 
+## Pure live-session check
+
+`bun run test:pure` runs the complete bounded-exhaustive live-session model
+check directly on the host at the supported depth (`LIVE_MODEL_DEPTH=10` by
+default). It selects only `test/live-machine.test.ts` and does not require
+Linux `flock`.
+
+`bun test` runs the full integration suite. Its output lease requires Linux
+`flock` from util-linux, so run it with
+`docker compose -f docker-compose.test.yml run --rm --build engine-test`.
+`bun run check:pure-modules` validates that the pure live-session module keeps
+runtime and I/O dependencies out of its reducer boundary.
+
 ## Initial pass and scheduler
 
 `runInitialPass({ sourcePath, outputPath, declare, handle })` returns an Effect.

@@ -16,9 +16,11 @@
   },
   "scripts": {
     "check": "bun run lint && bun run typecheck && bun test",
+    "check:pure-modules": "bun scripts/check-pure-modules.ts",
     "lint": "oxlint --deny-warnings src test scripts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
+    "test:pure": "SYNC_ENGINE_PURE=1 bun test test/live-machine.test.ts",
     "verify:pack": "bun scripts/verify-pack.ts"
   },
   "peerDependencies": {

@@ -1,5 +1,5 @@
 // Preloaded by bunfig.toml. Without flock every lease-opening test fails on its own, burying the cause under timeouts.
-if (Bun.which("flock") === null) {
+if (Bun.which("flock") === null && process.env.SYNC_ENGINE_PURE !== "1") {
   console.error(`flock (util-linux) is not on PATH, and the output lease needs it. Run the tests in Docker:
 
   docker compose -f docker-compose.test.yml run --rm --build engine-test
