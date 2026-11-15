@@ -1,9 +1,10 @@
 import { Deferred, Effect, Exit, type Scope } from "effect";
 import { realpath } from "node:fs/promises";
-import { relative, resolve, sep } from "node:path";
+import { resolve } from "node:path";
 import { acquireOutputTree, canonicalDestination, engineStatePath, OutputOwnershipFailed } from "./ownership.ts";
 import { openFreshness, type FreshnessFailed } from "./freshness.ts";
 import { scanSource, ScanFailed, type InitialPass, type Synchronization } from "./initial-pass.ts";
+import { pathsOverlap } from "./paths.ts";
 import { createWorkScheduler } from "./work.ts";
 
 export interface InternalOpening<W, E> {
@@ -25,15 +26,8 @@ export function openSynchronizationInternal<W, E, R>(options: InitialPass<W, E, 
     yield* Effect.tryPromise({
       try: async () => {
         const output = await canonicalDestination(resolve(options.outputPath));
-        const insideSource = relative(source, output);
-
-        const sourceInsideOutput = relative(output, source);
-        const isWithin = (path: string) => path === "" || (!path.startsWith(`..${sep}`) && path !== ".." && !path.startsWith(sep));
-
-        if (isWithin(insideSource) || isWithin(sourceInsideOutput)) {
-          throw new Error("Source and output trees must be disjoint");
-        }
-        if (isWithin(relative(source, statePath)) || isWithin(relative(statePath, source))) throw new Error("Source and state trees must be disjoint");
+        if (pathsOverlap(source, output)) throw new Error("Source and output trees must be disjoint");
+        if (pathsOverlap(source, statePath)) throw new Error("Source and state trees must be disjoint");
       },
       catch: (cause) => new OutputOwnershipFailed({ path: options.outputPath, cause }),
     }).pipe(Effect.uninterruptible);
