@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { isAbsolute, join, normalize, sep } from "node:path";
+import { isAbsolute, join, normalize } from "node:path";
 import { Data, Effect } from "effect";
 import type { WorkOptions } from "./work.ts";
+import { isPathWithin } from "./paths.ts";
 
 export interface ResultDescriptor {
   readonly sourcePaths: readonly string[];
@@ -31,7 +32,7 @@ const isAbsentPath = (cause: unknown) => cause instanceof Error && "code" in cau
 
 function checkedPath(root: string, path: string) {
   const normalized = normalize(path);
-  if (isAbsolute(path) || normalized === ".." || normalized.startsWith(`..${sep}`)) throw new Error(`Expected a tree-relative path: ${path}`);
+  if (isAbsolute(path) || !isPathWithin(root, join(root, normalized))) throw new Error(`Expected a tree-relative path: ${path}`);
   return join(root, path);
 }
 

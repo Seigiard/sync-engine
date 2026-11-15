@@ -3,6 +3,7 @@ import { lstat, readdir, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { SourceEntry } from "./source-snapshot.ts";
 import { canonicalDestination } from "./ownership.ts";
+import { isPathWithin, pathsOverlap } from "./paths.ts";
 
 export interface SourceStat {
   readonly size: number;
@@ -39,8 +40,8 @@ export class OutputCleanupFailed extends Data.TaggedError("OutputCleanupFailed")
 function confinedPath(root: string, path: string, allowRoot = false): string {
   if (isAbsolute(path) || path.split(sep).includes("..")) throw new Error("Expected a confined relative path");
   const absolute = resolve(root, path);
-  const within = relative(resolve(root), absolute);
-  if ((!allowRoot && within === "") || within === ".." || within.startsWith(`..${sep}`) || isAbsolute(within)) throw new Error("Path leaves its owned tree");
+  const rootPath = resolve(root);
+  if ((!allowRoot && absolute === rootPath) || !isPathWithin(rootPath, absolute)) throw new Error("Path leaves its owned tree");
   return absolute;
 }
 
@@ -119,8 +120,7 @@ export function removeAssociatedOutputs(options: AssociatedOutputs, fs: SourceFi
         for (const output of options.outputs) {
           const path = confinedPath(root, output);
           if (state !== undefined) {
-            const overlaps = (a: string, b: string) => { const within = relative(a, b); return within === "" || (!within.startsWith(`..${sep}`) && within !== ".." && !isAbsolute(within)); };
-            if (overlaps(path, state) || overlaps(state, path)) throw new Error("Cleanup overlaps engine state");
+            if (pathsOverlap(path, state)) throw new Error("Cleanup overlaps engine state");
           }
           // Check every existing ancestor, not just lexical containment. Never traverse an alias.
           let current = root;
