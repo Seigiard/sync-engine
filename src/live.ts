@@ -215,6 +215,7 @@ export function startLiveSynchronizationWithHooks<W, E, R>(options: LiveOptions<
           includeSource: options.includeSource,
           passParent: entry.passes!,
           synchronization: entry.opening!.synchronization,
+          beginFreshnessBatch: entry.opening!.beginFreshnessBatch,
           commitFreshness: entry.opening!.commitFreshness,
           claim: (changes) => dispatch({ tag: "passClaim", pass, changes }).pipe(Effect.map(({ claimed }) => claimed)),
           declare: options.declare,

@@ -155,8 +155,11 @@ read from being recorded as current. `force: true` bypasses all retained freshne
 Returned required work invalidates its dependent result, so a changed upstream
 cannot shortcut the publication it requires.
 
-Dirty records are removed before processing. Only a completed successful batch
-records new freshness; a failure or interruption leaves work eligible for replay.
+Dirty records are removed before processing. Each live pass starts a new freshness
+batch and retires candidates and failure state left by an uncommitted pass. Only
+a completed successful batch records new freshness; a failure or interruption
+leaves work eligible for replay, while a later successful pass retains its own
+results.
 Sources are checked before/after processing and again at successful completion.
 The output lease serializes retained-state access. `FreshnessFailed` reports
 source/output-check and state-read/write failures. `openFreshness` is the adapter

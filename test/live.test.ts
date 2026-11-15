@@ -156,6 +156,68 @@ test("a failed later publication does not record freshness for unpublished outpu
   }
 });
 
+test("a recovered live pass retains output after its failed handler and publication", async () => {
+  // #given a retained result and a later pass whose handler and publication both fail
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-recovered-freshness-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "note.txt"), "Initial");
+  const handled: string[] = [];
+  let failHandler = false;
+  let failPublish = false;
+  const options = {
+    sourcePath,
+    outputPath,
+    reconcileIntervalMs: 0,
+    freshness: { describe: () => ({ sourcePaths: ["note.txt"], resultKind: "note", processingVersion: "v1", outputPaths: ["published.txt"] }) },
+    declare: () => Effect.succeed({
+      work: ["note"],
+      publish: failPublish ? Effect.fail(new Error("publish failed")) : Effect.void,
+    }),
+    handle: () => io(() => readFile(join(sourcePath, "note.txt"), "utf8")).pipe(Effect.flatMap((text) => {
+      handled.push(text);
+      return failHandler
+        ? Effect.fail(new Error("handler failed"))
+        : io(async () => {
+            await Bun.write(join(outputPath, "published.txt"), `Published: ${text}`);
+            return [] as string[];
+          });
+    })),
+  };
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* openLiveSynchronization(options);
+      yield* io(() => Bun.write(join(sourcePath, "note.txt"), "Failed"));
+      failHandler = true;
+      failPublish = true;
+      yield* session.requestPass();
+      const failed = yield* Effect.exit(session.awaitCompletion);
+      yield* io(() => Bun.write(join(sourcePath, "note.txt"), "Recovered"));
+      failHandler = false;
+      failPublish = false;
+      yield* session.requestPass();
+      yield* session.awaitCompletion;
+      // #when an unchanged pass and a fresh session follow the recovered pass
+      yield* session.requestPass();
+      yield* session.awaitCompletion;
+      return {
+        failed: Exit.isFailure(failed),
+        published: yield* io(() => readFile(join(outputPath, "published.txt"), "utf8")),
+      };
+    })));
+    await Effect.runPromise(runInitialPass(options));
+    // #then both reuse the recovered output without another handler execution
+    expect({ ...result, handled }).toEqual({
+      failed: true,
+      published: "Published: Recovered",
+      handled: ["Initial", "Failed", "Recovered"],
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("combined requests during processing preserve a forced repair of unchanged sources", async () => {
   // #given two real sources and a previously published representation
   const root = await mkdtemp(join(tmpdir(), "sync-engine-forced-"));

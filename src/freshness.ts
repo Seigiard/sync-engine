@@ -124,6 +124,10 @@ export function openFreshness<W, E, R>(
     };
 
     return {
+      beginBatch: Effect.sync(() => {
+        failed = false;
+        candidates.clear();
+      }),
       invalidateWork: (work: readonly W[]) => io(async () => {
         for (const item of work) {
           const descriptor = options.freshness?.describe(item);

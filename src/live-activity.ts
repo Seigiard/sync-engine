@@ -12,6 +12,7 @@ export interface LaterActivityOptions<W, E, R> {
   readonly includeSource?: (relativePath: string) => boolean;
   readonly passParent: Scope.Closeable;
   readonly synchronization: Synchronization<W, E | FreshnessFailed>;
+  readonly beginFreshnessBatch: Effect.Effect<void, E | FreshnessFailed>;
   readonly commitFreshness: Effect.Effect<void, E | FreshnessFailed>;
   readonly claim: (changes: readonly string[]) => Effect.Effect<PassRequest | undefined, never, R>;
   readonly declare: (entries: readonly SourceEntry[], request: PassRequest) => Effect.Effect<InitialPlan<W, E, R>, E, R>;
@@ -42,6 +43,7 @@ export function runLaterActivity<W, E, R>(options: LaterActivityOptions<W, E, R>
     let committed = false;
     let baseline = options.baseline;
     const steps = Effect.gen(function* () {
+      yield* options.beginFreshnessBatch;
       const entries = yield* scanSource(options.sourcePath, options.includeSource);
       const declared = yield* options.claim(differences(baseline, entries));
       // Only a stopped session refuses the claim; the pass then declares nothing.
