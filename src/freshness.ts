@@ -1,8 +1,18 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { isAbsolute, join, normalize, sep } from "node:path";
+import { isAbsolute, join, normalize } from "node:path";
 import { Data, Effect } from "effect";
+import {
+  decodeFreshnessRecords,
+  decodeResultIdentity,
+  encodeFreshnessRecords,
+  encodeResultIdentity,
+  encodeSourceStamp,
+  type FreshnessSourceSnapshot,
+} from "./freshness-codec.ts";
 import type { WorkOptions } from "./work.ts";
+import { isPathWithin } from "./paths.ts";
+import type { OutputCleanup } from "./source.ts";
 
 export interface ResultDescriptor {
   readonly sourcePaths: readonly string[];
@@ -31,7 +41,7 @@ const isAbsentPath = (cause: unknown) => cause instanceof Error && "code" in cau
 
 function checkedPath(root: string, path: string) {
   const normalized = normalize(path);
-  if (isAbsolute(path) || normalized === ".." || normalized.startsWith(`..${sep}`)) throw new Error(`Expected a tree-relative path: ${path}`);
+  if (isAbsolute(path) || !isPathWithin(root, join(root, normalized))) throw new Error(`Expected a tree-relative path: ${path}`);
   return join(root, path);
 }
 
@@ -55,11 +65,7 @@ export function openFreshness<W, E, R>(
         if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") return;
         throw cause;
       }
-      const saved: unknown = JSON.parse(text);
-      if (saved === null || typeof saved !== "object" || Array.isArray(saved)) throw new Error("Invalid freshness state");
-      for (const [key, value] of Object.entries(saved)) {
-        const identity: unknown = JSON.parse(key);
-        if (!Array.isArray(identity) || typeof identity[0] !== "string" || !Array.isArray(identity[1]) || !identity[1].every((item: unknown) => typeof item === "string") || typeof value !== "string") throw new Error("Invalid freshness record");
+      for (const [key, value] of decodeFreshnessRecords(text)) {
         records.set(key, value);
       }
     });
@@ -67,7 +73,7 @@ export function openFreshness<W, E, R>(
     let saving = Promise.resolve();
     const save = () => {
       if (!options.freshness) return Promise.resolve();
-      const text = JSON.stringify(Object.fromEntries(records));
+      const text = encodeFreshnessRecords(records);
       const next = saving.then(async () => {
         await writeFile(`${path}.tmp`, text);
         await rename(`${path}.tmp`, path);
@@ -75,14 +81,14 @@ export function openFreshness<W, E, R>(
       saving = next.catch(() => {});
       return next;
     };
-    const identity = (descriptor: ResultDescriptor) => JSON.stringify([descriptor.resultKind, descriptor.sourcePaths]);
+    const identity = (descriptor: ResultDescriptor) => encodeResultIdentity(descriptor);
     const invalidateKey = (key: string) => {
       records.delete(key);
       candidates.delete(key);
       revisions.set(key, (revisions.get(key) ?? 0) + 1);
     };
     const stamp = async (descriptor: ResultDescriptor) => {
-      const sources = [];
+      const sources: FreshnessSourceSnapshot[] = [];
       for (const source of descriptor.sourcePaths) {
         const absolute = checkedPath(options.sourcePath, source);
         let info;
@@ -90,15 +96,22 @@ export function openFreshness<W, E, R>(
         catch (cause) {
           // A vanished source differs from a prior present source. If a handler confirms absence successfully,
           // the absent stamp can be retained until the source returns.
-          if (isAbsentPath(cause)) { sources.push([source, null, null, null]); continue; }
+          if (isAbsentPath(cause)) {
+            sources.push({ path: source, size: null, mtimeMs: null, digest: null });
+            continue;
+          }
           throw cause;
         }
         if (!info.isFile() && !info.isDirectory()) throw new Error(`Unsupported freshness source: ${source}`);
         const digest = options.freshness?.check === "content" && info.isFile()
           ? createHash("sha256").update(await readFile(absolute)).digest("hex") : null;
-        sources.push([source, info.size, info.mtimeMs, digest]);
+        sources.push({ path: source, size: info.size, mtimeMs: info.mtimeMs, digest });
       }
-      return JSON.stringify([descriptor.processingVersion, options.freshness?.check ?? "metadata", sources]);
+      return encodeSourceStamp({
+        processingVersion: descriptor.processingVersion,
+        check: options.freshness?.check ?? "metadata",
+        sources,
+      });
     };
     const outputsExist = async (descriptor: ResultDescriptor) => {
       for (const output of descriptor.outputPaths) {
@@ -112,6 +125,10 @@ export function openFreshness<W, E, R>(
     };
 
     return {
+      beginBatch: Effect.sync(() => {
+        failed = false;
+        candidates.clear();
+      }),
       invalidateWork: (work: readonly W[]) => io(async () => {
         for (const item of work) {
           const descriptor = options.freshness?.describe(item);
@@ -121,12 +138,12 @@ export function openFreshness<W, E, R>(
       }),
       invalidate: (input: WorkInput = {}) => io(async () => {
         for (const key of new Set([...records.keys(), ...candidates.keys(), ...revisions.keys()])) {
-          const [, sources]: [string, string[]] = JSON.parse(key);
+          const { sourcePaths: sources } = decodeResultIdentity(key);
           if (input.force || input.changedPaths?.some((hint) => sources.some((source) => source === hint || source.startsWith(`${hint}/`)))) invalidateKey(key);
         }
         await save();
       }),
-      handle: (work: W): Effect.Effect<readonly W[], E | FreshnessFailed, R> => Effect.gen(function* () {
+      handle: (work: W, cleanup?: OutputCleanup): Effect.Effect<readonly W[], E | FreshnessFailed, R> => Effect.gen(function* () {
         const descriptor = options.freshness?.describe(work);
         const key = descriptor && identity(descriptor);
         const before = descriptor && (yield* io(() => stamp(descriptor)));
@@ -136,7 +153,7 @@ export function openFreshness<W, E, R>(
           yield* io(save);
         }
         const revision = key === undefined ? 0 : revisions.get(key)!;
-        const downstream = yield* options.handle(work);
+        const downstream = yield* options.handle(work, cleanup);
         // A returned dependency must run even when its own source stamp is unchanged.
         let invalidatedDownstream = false;
         for (const item of downstream) {

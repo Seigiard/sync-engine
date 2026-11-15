@@ -1,7 +1,10 @@
 import { Cause, Effect, Exit, Scope } from "effect";
-import { scanSource, type InitialPlan, type ScanFailed, type SourceEntry, type Synchronization } from "./initial-pass.ts";
+import { scanSource, type ScanFailed } from "./source-scan.ts";
 import type { FreshnessFailed } from "./freshness.ts";
+import type { InitialPlan, Synchronization } from "./initial-pass.ts";
 import type { PassRequest } from "./live-machine.ts";
+import { differences } from "./source-snapshot.ts";
+import type { SourceEntry } from "./source-snapshot.ts";
 
 export interface LaterActivityOptions<W, E, R> {
   readonly baseline: readonly SourceEntry[];
@@ -9,6 +12,7 @@ export interface LaterActivityOptions<W, E, R> {
   readonly includeSource?: (relativePath: string) => boolean;
   readonly passParent: Scope.Closeable;
   readonly synchronization: Synchronization<W, E | FreshnessFailed>;
+  readonly beginFreshnessBatch: Effect.Effect<void, E | FreshnessFailed>;
   readonly commitFreshness: Effect.Effect<void, E | FreshnessFailed>;
   readonly claim: (changes: readonly string[]) => Effect.Effect<PassRequest | undefined, never, R>;
   readonly declare: (entries: readonly SourceEntry[], request: PassRequest) => Effect.Effect<InitialPlan<W, E, R>, E, R>;
@@ -33,24 +37,13 @@ export type LaterActivityResult<E> =
     readonly baseline: readonly SourceEntry[];
   };
 
-export function differences(before: readonly SourceEntry[], after: readonly SourceEntry[]): string[] {
-  const previous = new Map(before.map((entry) => [entry.path, entry]));
-  const changed = new Set<string>();
-  for (const entry of after) {
-    const old = previous.get(entry.path);
-    if (!old || old.kind !== entry.kind || (entry.kind === "file" && (old.size !== entry.size || old.mtimeMs !== entry.mtimeMs))) changed.add(entry.path);
-    previous.delete(entry.path);
-  }
-  for (const path of previous.keys()) changed.add(path);
-  return [...changed];
-}
-
 export function runLaterActivity<W, E, R>(options: LaterActivityOptions<W, E, R>): Effect.Effect<LaterActivityResult<E>, never, R> {
   return Effect.gen(function* () {
     // Set once the pass committed freshness: from then on its payload is applied, whatever fails afterwards.
     let committed = false;
     let baseline = options.baseline;
     const steps = Effect.gen(function* () {
+      yield* options.beginFreshnessBatch;
       const entries = yield* scanSource(options.sourcePath, options.includeSource);
       const declared = yield* options.claim(differences(baseline, entries));
       // Only a stopped session refuses the claim; the pass then declares nothing.

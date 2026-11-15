@@ -1,8 +1,9 @@
 import { Data, Effect } from "effect";
 import { lstat, readdir, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { SourceEntry } from "./initial-pass.ts";
+import type { SourceEntry } from "./source-snapshot.ts";
 import { canonicalDestination } from "./ownership.ts";
+import { isPathWithin, pathsOverlap } from "./paths.ts";
 
 export interface SourceStat {
   readonly size: number;
@@ -28,6 +29,7 @@ export class SourceObservationFailed extends Data.TaggedError("SourceObservation
   readonly path: string;
   readonly cause: unknown;
   readonly message: string;
+  readonly reason?: "unsupported-path";
 }> {}
 
 export class OutputCleanupFailed extends Data.TaggedError("OutputCleanupFailed")<{
@@ -36,16 +38,68 @@ export class OutputCleanupFailed extends Data.TaggedError("OutputCleanupFailed")
   readonly message: string;
 }> {}
 
+export type OutputCleanup = (outputs: readonly string[]) => Effect.Effect<boolean, OutputCleanupFailed>;
+
 function confinedPath(root: string, path: string, allowRoot = false): string {
   if (isAbsolute(path) || path.split(sep).includes("..")) throw new Error("Expected a confined relative path");
   const absolute = resolve(root, path);
-  const within = relative(resolve(root), absolute);
-  if ((!allowRoot && within === "") || within === ".." || within.startsWith(`..${sep}`) || isAbsolute(within)) throw new Error("Path leaves its owned tree");
+  const rootPath = resolve(root);
+  if ((!allowRoot && absolute === rootPath) || !isPathWithin(rootPath, absolute)) throw new Error("Path leaves its owned tree");
   return absolute;
 }
 
 const isMissing = (cause: unknown) => cause instanceof Error && "code" in cause && cause.code === "ENOENT";
 const message = (cause: unknown) => cause instanceof Error ? cause.message : String(cause);
+const unsupportedPathMarker = Symbol("unsupported-source-path");
+const unsupportedSourcePath = () => {
+  const cause = new Error("Unsupported source path");
+  Object.defineProperty(cause, unsupportedPathMarker, { value: true });
+  return cause;
+};
+const isUnsupportedSourcePath = (cause: unknown) => cause instanceof Error && Object.hasOwn(cause, unsupportedPathMarker);
+const observationFailure = (path: string, cause: unknown) => new SourceObservationFailed({
+  path,
+  cause,
+  message: message(cause),
+  ...(isUnsupportedSourcePath(cause) ? { reason: "unsupported-path" as const } : {}),
+});
+
+async function validatedOutputPaths(outputPath: string, statePath: string | undefined, outputs: readonly string[]): Promise<string[]> {
+  const root = await realpath(outputPath);
+  const state = statePath === undefined ? undefined : await canonicalDestination(resolve(statePath));
+  const paths: string[] = [];
+  for (const output of outputs) {
+    const path = confinedPath(root, output);
+    if (state !== undefined && pathsOverlap(path, state)) throw new Error("Cleanup overlaps engine state");
+    // Check every existing ancestor, not just lexical containment. Never traverse an alias.
+    let current = root;
+    for (const component of relative(root, dirname(path)).split(sep).filter(Boolean)) {
+      current = join(current, component);
+      try {
+        const info = await lstat(current);
+        if (info.isSymbolicLink() || !info.isDirectory()) throw new Error("Output ancestor is not an owned directory");
+      } catch (cause) {
+        if (!isMissing(cause)) throw cause;
+        break;
+      }
+    }
+    paths.push(path);
+  }
+  return paths;
+}
+
+async function removeOutputPaths(outputPath: string, statePath: string | undefined, outputs: readonly string[]): Promise<boolean> {
+  const paths = await validatedOutputPaths(outputPath, statePath, outputs);
+  for (const path of paths) await rm(path, { recursive: true, force: true });
+  return true;
+}
+
+export function removeBoundOutputs(outputPath: string, statePath: string, outputs: readonly string[]): Effect.Effect<boolean, OutputCleanupFailed> {
+  return Effect.tryPromise({
+    try: () => removeOutputPaths(outputPath, statePath, outputs),
+    catch: (cause) => new OutputCleanupFailed({ path: outputPath, cause, message: message(cause) }),
+  }).pipe(Effect.uninterruptible);
+}
 
 /** Confirm ancestors and root authority; a missing/unreadable root never means mass deletion. */
 export function observeSourcePath(sourcePath: string, path: string, fs: SourceFileSystem = nativeSourceFileSystem): Effect.Effect<SourceObservation, SourceObservationFailed> {
@@ -74,7 +128,7 @@ export function observeSourcePath(sourcePath: string, path: string, fs: SourceFi
           await confirmRoot();
           return { state: "absent" };
         }
-        if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw new Error("Unsupported source path");
+        if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw unsupportedSourcePath();
         if (current !== target && info.isFile()) {
           await confirmRoot();
           return { state: "absent" };
@@ -82,17 +136,17 @@ export function observeSourcePath(sourcePath: string, path: string, fs: SourceFi
       }
       return { state: "present", entry: { path: relative(root, target), kind: info.isDirectory() ? "directory" : "file", size: info.size, mtimeMs: info.mtimeMs } };
     },
-    catch: (cause) => new SourceObservationFailed({ path: join(sourcePath, path), cause, message: message(cause) }),
+    catch: (cause) => observationFailure(join(sourcePath, path), cause),
   }).pipe(Effect.uninterruptible);
 }
 
 /** Read errors stay failures, including ENOENT after a prior successful observation. */
 export function readSourceDirectory(sourcePath: string, path: string, fs: SourceFileSystem = nativeSourceFileSystem): Effect.Effect<readonly string[], SourceObservationFailed> {
   return observeSourcePath(sourcePath, path, fs).pipe(Effect.flatMap((observation) => {
-    if (observation.state === "absent" || observation.entry.kind !== "directory") return Effect.fail(new SourceObservationFailed({ path: join(sourcePath, path), cause: "Not an observable source directory", message: "Not an observable source directory" }));
+    if (observation.state === "absent" || observation.entry.kind !== "directory") return Effect.fail(observationFailure(join(sourcePath, path), "Not an observable source directory"));
     return Effect.tryPromise({
       try: () => fs.readdir(join(sourcePath, path)),
-      catch: (cause) => new SourceObservationFailed({ path: join(sourcePath, path), cause, message: message(cause) }),
+      catch: (cause) => observationFailure(join(sourcePath, path), cause),
     }).pipe(Effect.uninterruptible);
   }));
 }
@@ -112,33 +166,7 @@ export function removeAssociatedOutputs(options: AssociatedOutputs, fs: SourceFi
     const observation = yield* observeSourcePath(options.sourcePath, options.sourceRelativePath, fs);
     if (observation.state === "present") return false;
     return yield* Effect.tryPromise({
-      try: async () => {
-        const root = await realpath(options.outputPath);
-        const state = options.statePath === undefined ? undefined : await canonicalDestination(resolve(options.statePath));
-        const paths: string[] = [];
-        for (const output of options.outputs) {
-          const path = confinedPath(root, output);
-          if (state !== undefined) {
-            const overlaps = (a: string, b: string) => { const within = relative(a, b); return within === "" || (!within.startsWith(`..${sep}`) && within !== ".." && !isAbsolute(within)); };
-            if (overlaps(path, state) || overlaps(state, path)) throw new Error("Cleanup overlaps engine state");
-          }
-          // Check every existing ancestor, not just lexical containment. Never traverse an alias.
-          let current = root;
-          for (const component of relative(root, dirname(path)).split(sep).filter(Boolean)) {
-            current = join(current, component);
-            try {
-              const info = await lstat(current);
-              if (info.isSymbolicLink() || !info.isDirectory()) throw new Error("Output ancestor is not an owned directory");
-            } catch (cause) {
-              if (!isMissing(cause)) throw cause;
-              break;
-            }
-          }
-          paths.push(path);
-        }
-        for (const path of paths) await rm(path, { recursive: true, force: true });
-        return true;
-      },
+      try: () => removeOutputPaths(options.outputPath, options.statePath, options.outputs),
       catch: (cause) => new OutputCleanupFailed({ path: options.outputPath, cause, message: message(cause) }),
     }).pipe(Effect.uninterruptible);
   });
