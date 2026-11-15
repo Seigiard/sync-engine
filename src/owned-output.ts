@@ -2,10 +2,12 @@ import { Deferred, Effect, Exit, type Scope } from "effect";
 import { resolve } from "node:path";
 import { acquireResolvedOutputTree, type OutputIdentity, OutputOwnershipFailed, resolveOutputIdentity } from "./ownership.ts";
 import { pathsOverlap } from "./paths.ts";
+import { removeBoundOutputs, type OutputCleanup } from "./source.ts";
 
 export interface OwnedOutput extends OutputIdentity {
   readonly admit: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
   readonly check: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
+  readonly cleanup: OutputCleanup;
   readonly close: Effect.Effect<void>;
 }
 
@@ -51,6 +53,7 @@ export function openOwnedOutput(
       yield* Deferred.await(idle);
     }));
 
-    return { ...identity, admit, check, close };
+    const cleanup: OutputCleanup = (outputs) => admit(removeBoundOutputs(identity.outputPath, identity.statePath, outputs));
+    return { ...identity, admit, check, cleanup, close };
   });
 }

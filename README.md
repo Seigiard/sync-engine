@@ -41,6 +41,15 @@ unrestricted.
 `openSynchronization(options)` runs the same initial pass and returns a scoped
 `Synchronization`, compatible with `WorkScheduler`. Keep it inside `Effect.scoped`; its output lease remains held
 until the scope closes. `submit(work)` accepts subsequent application work.
+The handler receives a second `cleanup` argument. It is bound to the current
+session and accepts the complete list of application-selected output
+projections to remove. The engine validates every projection before removing
+any of them, rejects root, traversal, absolute, symlink-ancestor and state-area
+paths, and returns an Effect failure for an invalid declaration. The callback
+does not observe sources or choose projections; call it only after the
+application has authoritative evidence that the selected projections are
+obsolete. A callback captured from a handler fails after the session scope
+closes, and an admitted cleanup finishes before the output lease is released.
 After that scope closes, the returned handle rejects admission and completion
 without touching retained freshness.
 `awaitCompletion` waits for pending, active and handler-returned required work.
