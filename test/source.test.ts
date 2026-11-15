@@ -3,7 +3,101 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink } from "node:fs/p
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Effect, Exit } from "effect";
-import { engineStatePath, observeSourcePath, openSynchronization, readSourceDirectory, removeAssociatedOutputs } from "../src/index.ts";
+import { engineStatePath, observeSourcePath, openSynchronization, readSourceDirectory, removeAssociatedOutputs, type SourceFileSystem } from "../src/index.ts";
+
+test("a child symlink exposes unsupported-path while retaining legacy observation fields", async () => {
+  // #given a real source child symlink
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-source-symlink-"));
+  const sourcePath = join(root, "source");
+  const childPath = join(sourcePath, "child");
+  await mkdir(sourcePath);
+  await symlink(join(root, "target"), childPath);
+  try {
+    // #when the public observer reads the unsupported child
+    const failure = await Effect.runPromise(observeSourcePath(sourcePath, "child").pipe(Effect.match({
+      onFailure: (failure) => ({
+        reason: (failure as { readonly reason?: "unsupported-path" }).reason,
+        path: failure.path,
+        cause: failure.cause instanceof Error ? { name: failure.cause.name, message: failure.cause.message } : failure.cause,
+        message: failure.message,
+      }),
+      onSuccess: () => undefined,
+    })));
+    // #then consumers receive a stable classification without losing legacy fields
+    expect(failure).toEqual({
+      reason: "unsupported-path",
+      path: childPath,
+      cause: { name: "Error", message: "Unsupported source path" },
+      message: "Unsupported source path",
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an unavailable source root retains declared output", async () => {
+  // #given a real output and an external root-stat read fault
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-source-root-fault-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const outputFile = join(outputPath, "gone", "result");
+  await mkdir(sourcePath);
+  await mkdir(join(outputPath, "gone"), { recursive: true });
+  await Bun.write(outputFile, "Previous result");
+  const fault: SourceFileSystem = {
+    lstat: async (path) => {
+      if (path === sourcePath) throw Object.assign(new Error("Unreadable source root"), { code: "EACCES" });
+      return lstat(path);
+    },
+    readdir,
+  };
+  try {
+    // #when cleanup cannot establish source-root authority
+    const cleanup = await Effect.runPromiseExit(removeAssociatedOutputs({
+      sourcePath, outputPath, sourceRelativePath: "gone", outputs: ["gone"],
+    }, fault));
+    // #then failure leaves the declared output intact
+    expect({
+      failed: Exit.isFailure(cleanup),
+      output: await readFile(outputFile, "utf8"),
+    }).toEqual({ failed: true, output: "Previous result" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an incomplete parent read retains declared output", async () => {
+  // #given a real source child and an external child-stat read fault
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-source-parent-fault-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const outputFile = join(outputPath, "folder", "result");
+  const childPath = join(sourcePath, "folder", "book");
+  await mkdir(join(sourcePath, "folder"), { recursive: true });
+  await Bun.write(childPath, "Source book");
+  await mkdir(join(outputPath, "folder"), { recursive: true });
+  await Bun.write(outputFile, "Previous result");
+  const fault: SourceFileSystem = {
+    lstat: async (path) => {
+      if (path === childPath) throw Object.assign(new Error("Missing during read"), { code: "ENOENT" });
+      return lstat(path);
+    },
+    readdir,
+  };
+  try {
+    // #when the parent listing contradicts the failed child stat
+    const cleanup = await Effect.runPromiseExit(removeAssociatedOutputs({
+      sourcePath, outputPath, sourceRelativePath: "folder/book", outputs: ["folder/book"],
+    }, fault));
+    // #then absence is not confirmed and cleanup preserves output
+    expect({
+      failed: Exit.isFailure(cleanup),
+      output: await readFile(outputFile, "utf8"),
+    }).toEqual({ failed: true, output: "Previous result" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("an incomplete source observation retains results but confirmed removal permits associated cleanup", async () => {
   // #given real trees and an external directory-read fault
@@ -66,11 +160,12 @@ test("cleanup rejects traversal, root removal and symlink ancestors without touc
     // #when the public cleanup API receives unsafe application projections
     const failures = [];
     for (const outputs of [["../user"], [""], ["alias/keep"], [join(root, "user")]]) {
-      failures.push(Exit.isFailure(await Effect.runPromiseExit(removeAssociatedOutputs({ sourcePath, outputPath, sourceRelativePath: "gone", outputs }))));
+      const cleanup = await Effect.runPromiseExit(removeAssociatedOutputs({ sourcePath, outputPath, sourceRelativePath: "gone", outputs }));
+      failures.push(Exit.isFailure(cleanup) ? cleanup.cause.reasons.map((reason) => reason._tag === "Fail" ? reason.error._tag : reason._tag) : []);
     }
     const missingRoot = await Effect.runPromiseExit(removeAssociatedOutputs({ sourcePath: join(root, "missing"), outputPath, sourceRelativePath: "gone", outputs: ["keep"] }));
     // #then neither incomplete authority nor unsafe declarations remove useful files
-    expect({ failures, missingRoot: Exit.isFailure(missingRoot), user: await readFile(join(root, "user", "keep"), "utf8"), unrelated: await readFile(join(outputPath, "keep"), "utf8") }).toEqual({ failures: [true, true, true, true], missingRoot: true, user: "User data", unrelated: "Unrelated output" });
+    expect({ failures, missingRoot: Exit.isFailure(missingRoot), user: await readFile(join(root, "user", "keep"), "utf8"), unrelated: await readFile(join(outputPath, "keep"), "utf8") }).toEqual({ failures: [["OutputCleanupFailed"], ["OutputCleanupFailed"], ["OutputCleanupFailed"], ["OutputCleanupFailed"]], missingRoot: true, user: "User data", unrelated: "Unrelated output" });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
