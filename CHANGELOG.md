@@ -1,10 +1,6 @@
 # Changelog
 
-## Unreleased
-
-These notes describe the changes on the branch after released `0.5.6`. They
-are not a release announcement. The next release number is intentionally not
-set here.
+## 0.6.0 — 2026-11-15
 
 ### Output cleanup
 

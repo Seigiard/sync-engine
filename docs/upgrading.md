@@ -1,13 +1,12 @@
-# Updating from `0.5.6`
+# Updating from `0.5.6` to `0.6.0`
 
 This guide is for every application that consumes
-`@seigiard/sync-engine`. It describes a package version update to the next
-released version. It does not name or change a consuming application.
+`@seigiard/sync-engine`. It describes the package version update to `0.6.0`.
+It does not name or change a consuming application.
 
 ## Required package update
 
-The next release number is intentionally not specified in this guide. Use the
-actual version published in the registry.
+Use the exact registry version `0.6.0` after publication is complete.
 
 1. Set `@seigiard/sync-engine` to that exact registry version in the consumer
    manifest. Do not use a version range, a `file:` dependency, a local
