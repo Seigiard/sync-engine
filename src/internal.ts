@@ -27,8 +27,8 @@ export function openSynchronizationInternal<W, E, R>(options: InitialPass<W, E, 
     const entries = yield* scanSource(options.sourcePath, options.includeSource);
     const plan = yield* options.declare(entries);
     const rawFreshness = yield* openFreshness({ ...options, outputPath: owned.outputPath }, owned.statePath);
-    const scheduler = yield* createWorkScheduler({ ...options, handle: (work) => owned.check(rawFreshness.handle(work)) });
     yield* Effect.addFinalizer(() => owned.close);
+    const scheduler = yield* createWorkScheduler({ ...options, handle: (work) => owned.admit(rawFreshness.handle(work, owned.cleanup)) });
     if (plan.minimum !== undefined && plan.minimum.length > 0) {
       yield* scheduler.submit(plan.minimum);
       yield* scheduler.awaitCompletion;

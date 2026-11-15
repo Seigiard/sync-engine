@@ -38,6 +38,8 @@ export class OutputCleanupFailed extends Data.TaggedError("OutputCleanupFailed")
   readonly message: string;
 }> {}
 
+export type OutputCleanup = (outputs: readonly string[]) => Effect.Effect<boolean, OutputCleanupFailed>;
+
 function confinedPath(root: string, path: string, allowRoot = false): string {
   if (isAbsolute(path) || path.split(sep).includes("..")) throw new Error("Expected a confined relative path");
   const absolute = resolve(root, path);
@@ -61,6 +63,43 @@ const observationFailure = (path: string, cause: unknown) => new SourceObservati
   message: message(cause),
   ...(isUnsupportedSourcePath(cause) ? { reason: "unsupported-path" as const } : {}),
 });
+
+async function validatedOutputPaths(outputPath: string, statePath: string | undefined, outputs: readonly string[]): Promise<string[]> {
+  const root = await realpath(outputPath);
+  const state = statePath === undefined ? undefined : await canonicalDestination(resolve(statePath));
+  const paths: string[] = [];
+  for (const output of outputs) {
+    const path = confinedPath(root, output);
+    if (state !== undefined && pathsOverlap(path, state)) throw new Error("Cleanup overlaps engine state");
+    // Check every existing ancestor, not just lexical containment. Never traverse an alias.
+    let current = root;
+    for (const component of relative(root, dirname(path)).split(sep).filter(Boolean)) {
+      current = join(current, component);
+      try {
+        const info = await lstat(current);
+        if (info.isSymbolicLink() || !info.isDirectory()) throw new Error("Output ancestor is not an owned directory");
+      } catch (cause) {
+        if (!isMissing(cause)) throw cause;
+        break;
+      }
+    }
+    paths.push(path);
+  }
+  return paths;
+}
+
+async function removeOutputPaths(outputPath: string, statePath: string | undefined, outputs: readonly string[]): Promise<boolean> {
+  const paths = await validatedOutputPaths(outputPath, statePath, outputs);
+  for (const path of paths) await rm(path, { recursive: true, force: true });
+  return true;
+}
+
+export function removeBoundOutputs(outputPath: string, statePath: string, outputs: readonly string[]): Effect.Effect<boolean, OutputCleanupFailed> {
+  return Effect.tryPromise({
+    try: () => removeOutputPaths(outputPath, statePath, outputs),
+    catch: (cause) => new OutputCleanupFailed({ path: outputPath, cause, message: message(cause) }),
+  }).pipe(Effect.uninterruptible);
+}
 
 /** Confirm ancestors and root authority; a missing/unreadable root never means mass deletion. */
 export function observeSourcePath(sourcePath: string, path: string, fs: SourceFileSystem = nativeSourceFileSystem): Effect.Effect<SourceObservation, SourceObservationFailed> {
@@ -127,32 +166,7 @@ export function removeAssociatedOutputs(options: AssociatedOutputs, fs: SourceFi
     const observation = yield* observeSourcePath(options.sourcePath, options.sourceRelativePath, fs);
     if (observation.state === "present") return false;
     return yield* Effect.tryPromise({
-      try: async () => {
-        const root = await realpath(options.outputPath);
-        const state = options.statePath === undefined ? undefined : await canonicalDestination(resolve(options.statePath));
-        const paths: string[] = [];
-        for (const output of options.outputs) {
-          const path = confinedPath(root, output);
-          if (state !== undefined) {
-            if (pathsOverlap(path, state)) throw new Error("Cleanup overlaps engine state");
-          }
-          // Check every existing ancestor, not just lexical containment. Never traverse an alias.
-          let current = root;
-          for (const component of relative(root, dirname(path)).split(sep).filter(Boolean)) {
-            current = join(current, component);
-            try {
-              const info = await lstat(current);
-              if (info.isSymbolicLink() || !info.isDirectory()) throw new Error("Output ancestor is not an owned directory");
-            } catch (cause) {
-              if (!isMissing(cause)) throw cause;
-              break;
-            }
-          }
-          paths.push(path);
-        }
-        for (const path of paths) await rm(path, { recursive: true, force: true });
-        return true;
-      },
+      try: () => removeOutputPaths(options.outputPath, options.statePath, options.outputs),
       catch: (cause) => new OutputCleanupFailed({ path: options.outputPath, cause, message: message(cause) }),
     }).pipe(Effect.uninterruptible);
   });

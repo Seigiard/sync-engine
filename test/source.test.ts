@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { Effect, Exit } from "effect";
 import { engineStatePath, observeSourcePath, openSynchronization, readSourceDirectory, removeAssociatedOutputs, type SourceFileSystem } from "../src/index.ts";
 
+type BoundCleanup = (outputs: readonly string[]) => Effect.Effect<boolean, Error>;
+
 test("a child symlink exposes unsupported-path while retaining legacy observation fields", async () => {
   // #given a real source child symlink
   const root = await mkdtemp(join(tmpdir(), "sync-engine-source-symlink-"));
@@ -211,6 +213,60 @@ test("explicit in-output bookkeeping shares canonical aliases and is excluded fr
     const cleanup = await Effect.runPromiseExit(removeAssociatedOutputs({ sourcePath, outputPath, statePath, sourceRelativePath: "gone", outputs: [".sync-engine"] }));
     // #then configuration preserves canonical identity and protects the state itself
     expect({ canonical, rejected: Exit.isFailure(cleanup), saved: await readFile(join(statePath, "saved"), "utf8") }).toEqual({ canonical: statePath, rejected: true, saved: "Persistent engine state" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("session-bound cleanup validates every projection before removing any declared output", async () => {
+  // #given a session-owned output tree with one safe projection and several unsafe declarations
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-bound-cleanup-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const statePath = join(outputPath, ".sync-engine");
+  const safeFile = join(outputPath, "safe", "result");
+  const outsideFile = join(root, "outside", "result");
+  await mkdir(sourcePath);
+  await mkdir(join(outputPath, "safe"), { recursive: true });
+  await mkdir(join(root, "outside"), { recursive: true });
+  await mkdir(statePath);
+  await Bun.write(safeFile, "Safe projection");
+  await Bun.write(outsideFile, "Outside output");
+  await Bun.write(join(statePath, "saved"), "Engine state");
+  await symlink(join(root, "outside"), join(outputPath, "alias"));
+  const declarations = [
+    ["safe", "../outside"],
+    ["safe", ""],
+    ["safe", join(root, "outside")],
+    ["safe", "alias/result"],
+    ["safe", ".sync-engine"],
+  ] as const;
+  const rejected: boolean[] = [];
+  try {
+    // #when a handler requests bound cleanup for each unsafe complete declaration
+    await Effect.runPromise(Effect.scoped(openSynchronization({
+      sourcePath, outputPath, statePath,
+      declare: () => Effect.succeed({ work: ["cleanup"], publish: Effect.void }),
+      handle: (_work: string, cleanup?: BoundCleanup) => Effect.forEach(
+        declarations,
+        (outputs) => (cleanup?.(outputs) ?? Effect.succeed(false)).pipe(Effect.exit),
+      ).pipe(Effect.map((exits) => {
+        rejected.push(...exits.map(Exit.isFailure));
+        return [];
+      })),
+    })));
+    // #then each rejection preserves every previously declared projection and protected tree
+    expect({
+      rejected,
+      safe: await readFile(safeFile, "utf8"),
+      outside: await readFile(outsideFile, "utf8"),
+      state: await readFile(join(statePath, "saved"), "utf8"),
+    }).toEqual({
+      rejected: [true, true, true, true, true],
+      safe: "Safe projection",
+      outside: "Outside output",
+      state: "Engine state",
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

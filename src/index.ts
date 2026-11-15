@@ -1,7 +1,7 @@
 import { Effect, type Scope } from "effect";
 import { type OutputOwnershipFailed } from "./ownership.ts";
 export { acquireOutputTree, engineStatePath, OutputOwnershipFailed } from "./ownership.ts";
-export { observeSourcePath, readSourceDirectory, removeAssociatedOutputs, nativeSourceFileSystem, SourceObservationFailed, OutputCleanupFailed, type SourceFileSystem, type SourceObservation, type AssociatedOutputs } from "./source.ts";
+export { observeSourcePath, readSourceDirectory, removeAssociatedOutputs, nativeSourceFileSystem, SourceObservationFailed, OutputCleanupFailed, type SourceFileSystem, type SourceObservation, type AssociatedOutputs, type OutputCleanup } from "./source.ts";
 export { createWorkScheduler, type WorkOptions, type WorkScheduler, type WorkStatus, type WorkFailure } from "./work.ts";
 export { openLiveSynchronization, startLiveSynchronization, type LiveOptions, type LiveSynchronization, type LiveHandle, type PassRequest, type PassAdmission, type LiveStatus, type Availability } from "./live.ts";
 import type { FreshnessFailed } from "./freshness.ts";

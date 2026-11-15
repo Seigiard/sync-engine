@@ -12,6 +12,7 @@ import {
 } from "./freshness-codec.ts";
 import type { WorkOptions } from "./work.ts";
 import { isPathWithin } from "./paths.ts";
+import type { OutputCleanup } from "./source.ts";
 
 export interface ResultDescriptor {
   readonly sourcePaths: readonly string[];
@@ -142,7 +143,7 @@ export function openFreshness<W, E, R>(
         }
         await save();
       }),
-      handle: (work: W): Effect.Effect<readonly W[], E | FreshnessFailed, R> => Effect.gen(function* () {
+      handle: (work: W, cleanup?: OutputCleanup): Effect.Effect<readonly W[], E | FreshnessFailed, R> => Effect.gen(function* () {
         const descriptor = options.freshness?.describe(work);
         const key = descriptor && identity(descriptor);
         const before = descriptor && (yield* io(() => stamp(descriptor)));
@@ -152,7 +153,7 @@ export function openFreshness<W, E, R>(
           yield* io(save);
         }
         const revision = key === undefined ? 0 : revisions.get(key)!;
-        const downstream = yield* options.handle(work);
+        const downstream = yield* options.handle(work, cleanup);
         // A returned dependency must run even when its own source stamp is unchanged.
         let invalidatedDownstream = false;
         for (const item of downstream) {
