@@ -1,9 +1,12 @@
 import { Cause, Deferred, Effect, Exit, Fiber, Scope } from "effect";
 import { openSynchronizationInternal, type InternalOpening } from "./internal.ts";
-import { scanSource, type InitialPass, type InitialPlan, type SourceEntry, type ScanFailed } from "./initial-pass.ts";
-import { differences, runLaterActivity } from "./live-activity.ts";
+import { scanSource, type ScanFailed } from "./source-scan.ts";
+import type { InitialPass, InitialPlan } from "./initial-pass.ts";
+import { runLaterActivity } from "./live-activity.ts";
 import type { FreshnessFailed } from "./freshness.ts";
 import type { OutputOwnershipFailed } from "./ownership.ts";
+import { differences } from "./source-snapshot.ts";
+import type { SourceEntry } from "./source-snapshot.ts";
 import { INITIAL, init, invalidationTarget, Payload, step, view, type Availability, type Command, type Event, type PassAdmission, type PassRequest, type Session, type Settlement } from "./live-machine.ts";
 import type { WorkStatus } from "./work.ts";
 

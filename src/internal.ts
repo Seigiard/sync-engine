@@ -3,7 +3,8 @@ import { realpath } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
 import { acquireOutputTree, canonicalDestination, engineStatePath, OutputOwnershipFailed } from "./ownership.ts";
 import { openFreshness, type FreshnessFailed } from "./freshness.ts";
-import { scanSource, ScanFailed, type InitialPass, type Synchronization } from "./initial-pass.ts";
+import { scanSource, ScanFailed } from "./source-scan.ts";
+import type { InitialPass, Synchronization } from "./initial-pass.ts";
 import { createWorkScheduler } from "./work.ts";
 
 export interface InternalOpening<W, E> {

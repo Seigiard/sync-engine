@@ -11,9 +11,11 @@ Bun on Linux/Docker and Effect 4 are the supported execution boundary.
 ## Initial pass and scheduler
 
 `runInitialPass({ sourcePath, outputPath, declare, handle })` returns an Effect.
-It scans regular source paths and directories, with relative path identity,
-size and modification time. Source symlinks are excluded. Source/output trees
-must be disjoint. Applications declare an `InitialPlan`: initial work and a
+Its full source scan accepts a real directory root and traverses regular source
+paths and directories, with relative path identity, size and modification time.
+Child symlinks are excluded. A source-root symlink is unsupported and fails
+instead of being followed. Source/output trees must be disjoint. Applications
+declare an `InitialPlan`: initial work and a
 final publication Effect. Each handler returns required cascade work. The
 engine drains that work before final publication. Applications keep domain
 classification, extraction, rendering, path projection and publication rules.
@@ -74,10 +76,12 @@ All compositions that share an output must use the same canonical state area.
 Docker containers must mount that area on the same shared persistent filesystem;
 a shared output mount alone does not share a sibling on another filesystem.
 
-`observeSourcePath(sourcePath, relativePath, fs?)` returns present or confirmed
-absence. Missing or unreadable source roots fail with `SourceObservationFailed`.
-Absent children require a successful parent read, or a regular-file ancestor,
-and a valid root; symlink paths are excluded from source authority. `readSourceDirectory` preserves read errors.
+`observeSourcePath(sourcePath, relativePath, fs?)` is a point observation: it
+checks one relative path and returns present or confirmed absence. Missing or
+unreadable source roots fail with `SourceObservationFailed`; a source-root
+symlink is unsupported and fails. Absent children require a successful parent
+read, or a regular-file ancestor, and a valid root. Symlink paths are excluded
+from source authority. `readSourceDirectory` preserves read errors.
 The optional `SourceFileSystem` is an external read-only fault-injection boundary.
 
 `removeAssociatedOutputs({ sourcePath, outputPath, statePath?, sourceRelativePath,
