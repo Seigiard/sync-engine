@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "..");
-const pureModules = ["src/live-machine.ts", "src/source-snapshot.ts"] as const;
+const pureModules = ["src/live-machine.ts", "src/source-snapshot.ts", "src/freshness-codec.ts"] as const;
 const importLine = /^\s*(?:import|export)\s+(?!type\b)(?:[^;"'\n]+\s+from\s+)?["']([^"']+)["']/;
 const dynamicImport = /\b(?:import|require)\s*\(\s*["']([^"']+)["']\s*\)/g;
 
