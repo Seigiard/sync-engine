@@ -10,6 +10,7 @@ import { createWorkScheduler } from "./work.ts";
 export interface InternalOpening<W, E> {
   /** Its awaitCompletion drains subsequent work without committing freshness. */
   readonly synchronization: Synchronization<W, E>;
+  readonly beginFreshnessBatch: Effect.Effect<void, E>;
   readonly commitFreshness: Effect.Effect<void, E>;
 }
 
@@ -39,6 +40,7 @@ export function openSynchronizationInternal<W, E, R>(options: InitialPass<W, E, 
     yield* scheduler.awaitCompletion;
     const completed = yield* scheduler.status;
     if (completed.errors.length > 0) return yield* Effect.failCause(completed.errors[0]!.cause);
+    const beginFreshnessBatch = owned.admit(rawFreshness.beginBatch);
     const commitFreshness = owned.admit(rawFreshness.commit);
     const synchronization: Synchronization<W, E | FreshnessFailed> = {
       ...scheduler,
@@ -49,6 +51,6 @@ export function openSynchronizationInternal<W, E, R>(options: InitialPass<W, E, 
       awaitCompletion: Effect.suspend(() => owned.check(scheduler.awaitCompletion)),
     };
     yield* plan.publish;
-    return { synchronization, commitFreshness };
+    return { synchronization, beginFreshnessBatch, commitFreshness };
   });
 }
