@@ -22,8 +22,10 @@ Linux `flock`.
 `bun test` runs the full integration suite. Its output lease requires Linux
 `flock` from util-linux, so run it with
 `docker compose -f docker-compose.test.yml run --rm --build engine-test`.
-`bun run check:pure-modules` validates that the pure live-session module keeps
-runtime and I/O dependencies out of its reducer boundary.
+`bun run check:pure-modules` validates that `src/live-machine.ts` (the
+live-session reducer), `src/source-snapshot.ts` (the source snapshot), and
+`src/freshness-codec.ts` (the freshness codec) keep runtime and I/O
+dependencies out of their pure-module boundaries.
 
 ## Initial pass and scheduler
 

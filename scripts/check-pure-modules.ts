@@ -3,8 +3,7 @@ import { dirname, relative, resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "..");
 const pureModules = ["src/live-machine.ts", "src/source-snapshot.ts", "src/freshness-codec.ts"] as const;
-const importLine = /^\s*(?:import|export)\s+(?!type\b)(?:[^;"'\n]+\s+from\s+)?["']([^"']+)["']/;
-const dynamicImport = /\b(?:import|require)\s*\(\s*["']([^"']+)["']\s*\)/g;
+const transpiler = new Bun.Transpiler({ loader: "ts" });
 
 const modulePath = (path: string) => relative(root, path).replaceAll("\\", "/");
 
@@ -23,27 +22,29 @@ const checkSpecifier = (module: string, line: number, specifier: string, source:
   return null;
 };
 
+const locationOf = (source: string, specifier: string, from: number) => {
+  const doubleQuoted = source.indexOf(`"${specifier}"`, from);
+  const singleQuoted = source.indexOf(`'${specifier}'`, from);
+  const index = [doubleQuoted, singleQuoted].filter((candidate) => candidate >= 0).sort((left, right) => left - right)[0] ?? 0;
+  const lineStart = source.lastIndexOf("\n", index - 1) + 1;
+  const lineEnd = source.indexOf("\n", index);
+  return {
+    index,
+    line: source.slice(0, index).split("\n").length,
+    text: source.slice(lineStart, lineEnd < 0 ? source.length : lineEnd).trim(),
+  };
+};
+
 const violations: string[] = [];
 for (const module of pureModules) {
   const source = await readFile(resolve(root, module), "utf8");
-  const lines = source.split("\n");
-
-  lines.forEach((text, index) => {
-    const line = index + 1;
-    const match = text.match(importLine);
-    if (match?.[1] !== undefined) {
-      const violation = checkSpecifier(module, line, match[1], ` (${text.trim()})`);
-      if (violation !== null) violations.push(violation);
-    }
-
-    for (const dynamic of text.matchAll(dynamicImport)) {
-      const specifier = dynamic[1];
-      if (specifier !== undefined) {
-        const violation = checkSpecifier(module, line, specifier, ` (${text.trim()})`);
-        if (violation !== null) violations.push(violation);
-      }
-    }
-  });
+  let searchFrom = 0;
+  for (const dependency of transpiler.scanImports(source)) {
+    const location = locationOf(source, dependency.path, searchFrom);
+    searchFrom = location.index + dependency.path.length;
+    const violation = checkSpecifier(module, location.line, dependency.path, ` (${location.text})`);
+    if (violation !== null) violations.push(violation);
+  }
 }
 
 if (violations.length > 0) {
