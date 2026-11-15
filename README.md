@@ -8,6 +8,10 @@ Repository identity: `Seigiard/sync-engine`.
 The library owns synchronization mechanisms. Applications own domain processing and publication requirements.
 Bun on Linux/Docker and Effect 4 are the supported execution boundary.
 
+For release notes, see the [changelog](https://github.com/Seigiard/sync-engine/blob/main/CHANGELOG.md).
+For consumers updating from `0.5.6`, see the
+[version-update guide](https://github.com/Seigiard/sync-engine/blob/main/docs/upgrading.md).
+
 ## Pure live-session check
 
 `bun run test:pure` runs the complete bounded-exhaustive live-session model
@@ -83,7 +87,7 @@ required-work failures remain visible in status, but final publication still run
 so consumers can keep serving prior successful results. All native filesystem Promise crossings are owned.
 
 `acquireOutputTree(outputPath, statePath?)` supplies the same lease to legacy consumers
-during migration. It returns an async release function. Effect consumers use
+during a version update. It returns an async release function. Effect consumers use
 `Effect.acquireRelease` in a scope; Promise consumers must release it after
 joining their work. Linux `flock` (`util-linux`) holds a persistent lock inode
 at `engineStatePath(outputPath, statePath?)/lock`. A handshake confirms ownership. Release closes stdin
@@ -206,9 +210,11 @@ bun scripts/verify-pack.ts <destination>
 `verify-pack.ts` fails on a dirty tree, a version or peer mismatch, an unexpected file, or any packed
 source/README file that differs from the checkout. For `package.json`, it checks package name,
 version and peer dependencies instead of byte equality. It prints the commit, archive path, size,
-SHA256 and the SHA512 integrity string a lockfile records. A release is the `npm publish` of that archive's checkout; verify
+SHA256 and the SHA512 integrity string a lockfile records. Verify
 the registry afterwards with `npm view @seigiard/sync-engine@<version> dist.integrity` and compare it to
-the printed integrity.
+the printed integrity. Submit the archive through the
+[staged release procedure](https://github.com/Seigiard/sync-engine/blob/main/docs/releases.md);
+the maintainer approves the staged candidate.
 
 Update a consumer in two steps. Development: copy the archive to the consumer's `vendor/` under a
 content-qualified name, depend on `file:vendor/<name>` and rebuild its images; Bun caches file
@@ -323,4 +329,6 @@ SIGKILL, a shutdown deadline, or power loss at every intermediate write.
 ## Releases
 
 The package is staged from a clean CI job without project dependencies, then approved by a maintainer with npm 2FA.
-For publication setup, archive verification, or a version release, follow the [release procedure](https://github.com/Seigiard/sync-engine/blob/main/docs/releases.md).
+For publication setup, archive verification, or a version release, follow the [staged release procedure](https://github.com/Seigiard/sync-engine/blob/main/docs/releases.md).
+For unreleased changes, read the [changelog](https://github.com/Seigiard/sync-engine/blob/main/CHANGELOG.md).
+For a consumer version update from `0.5.6`, read the [version-update guide](https://github.com/Seigiard/sync-engine/blob/main/docs/upgrading.md).
