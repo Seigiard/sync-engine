@@ -30,7 +30,7 @@ Before changing publication or releasing a version, read `docs/releases.md` for 
 ## Architecture
 
 - `src/index.ts` is the public entry. `openSynchronization` composes the internal opening with its initial freshness commit, while `runInitialPass` scopes it. It builds on `ownership.ts` (lease, state area), `work.ts` (scheduler) and `freshness.ts` (retained results), and re-exports `source.ts` (observation, output cleanup).
-- `src/internal.ts` owns the type-checked two-phase opening: validation, lease, scan, declaration, minimum/required work and publication, followed by a synchronization handle whose completion only drains later work and an explicit freshness commit. `src/initial-pass.ts` owns the shared opening contracts and source scanner; public and live callers compose the commit operation.
+- `src/internal.ts` owns the type-checked two-phase opening: validation, lease, scan, declaration, minimum/required work and publication, followed by a synchronization handle whose completion only drains later work and an explicit freshness commit. `src/source-snapshot.ts` owns `SourceEntry` and `differences`; `src/source-scan.ts` owns native scanning and `ScanFailed`; `src/initial-pass.ts` holds the shared opening contracts. Public and live callers compose the commit operation.
 - `effect` is an exact peer (`4.0.1`) so consumers share one runtime identity. Keep the dev and peer versions equal.
 
 ### Live session: pure reducer + interpreter
