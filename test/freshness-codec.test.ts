@@ -6,15 +6,32 @@ import {
   encodeSourceStamp,
 } from "../src/freshness-codec.ts";
 
-const retainedRecord = "{\"[\\\"text\\\",[\\\"note.txt\\\"]]\":\"[\\\"v1\\\",\\\"metadata\\\",[[\\\"note.txt\\\",15,1577836800000,null]]]\"}";
-
-test("the pure codec decodes and re-encodes the pre-refactor retained record", () => {
+test("the pure codec decodes the literal pre-refactor retained record entries", () => {
   // #given a literal record written by the pre-refactor persistence format
-  const records = decodeFreshnessRecords(retainedRecord);
-  // #when the record is encoded without changing its retained value
+  const records = decodeFreshnessRecords(
+    "{\"[\\\"text\\\",[\\\"note.txt\\\"]]\":\"[\\\"v1\\\",\\\"metadata\\\",[[\\\"note.txt\\\",15,1577836800000,null]]]\"}",
+  );
+  // #when the codec exposes its retained entries to freshness consumers
+  const entries = [...records.entries()];
+  // #then each legacy key and value has its independently specified meaning
+  expect(entries).toEqual([[
+    "[\"text\",[\"note.txt\"]]",
+    "[\"v1\",\"metadata\",[[\"note.txt\",15,1577836800000,null]]]",
+  ]]);
+});
+
+test("the pure codec encodes independently constructed legacy record entries", () => {
+  // #given entries constructed without decoding persisted state
+  const records = new Map([[
+    "[\"text\",[\"note.txt\"]]",
+    "[\"v1\",\"metadata\",[[\"note.txt\",15,1577836800000,null]]]",
+  ]]);
+  // #when the records are persisted
   const encoded = encodeFreshnessRecords(records);
-  // #then the protocol bytes remain exactly compatible
-  expect(encoded).toBe(retainedRecord);
+  // #then their bytes retain the pre-refactor object protocol
+  expect(encoded).toBe(
+    "{\"[\\\"text\\\",[\\\"note.txt\\\"]]\":\"[\\\"v1\\\",\\\"metadata\\\",[[\\\"note.txt\\\",15,1577836800000,null]]]\"}",
+  );
 });
 
 test("the pure codec keeps result identity independent of version and outputs", () => {
@@ -68,11 +85,11 @@ test.each([
 });
 
 test.each([
-  "[]",
-  "{\"not json\":\"[\\\"v1\\\",\\\"metadata\\\",[]]\"}",
-  "{\"[\\\"text\\\",[1]]\":\"[\\\"v1\\\",\\\"metadata\\\",[]]\"}",
-  "{\"[\\\"text\\\",[\\\"note.txt\\\"]]\":false}",
-])("the pure codec rejects malformed retained state: %s", (saved) => {
+  { name: "top-level array", saved: "[]" },
+  { name: "non-JSON identity key", saved: "{\"not json\":\"[\\\"v1\\\",\\\"metadata\\\",[]]\"}" },
+  { name: "non-string identity source path", saved: "{\"[\\\"text\\\",[1]]\":\"[\\\"v1\\\",\\\"metadata\\\",[]]\"}" },
+  { name: "non-string retained stamp", saved: "{\"[\\\"text\\\",[\\\"note.txt\\\"]]\":false}" },
+])("the pure codec rejects malformed retained state: $name", ({ saved }) => {
   // #given a malformed persisted state shape
   // #when the codec decodes it
   const decode = () => decodeFreshnessRecords(saved);
