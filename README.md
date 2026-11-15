@@ -26,15 +26,17 @@ runtime and I/O dependencies out of its reducer boundary.
 `runInitialPass({ sourcePath, outputPath, declare, handle })` returns an Effect.
 Its full source scan accepts a real directory root and traverses regular source
 paths and directories, with relative path identity, size and modification time.
-Child symlinks are excluded. A source-root symlink is unsupported and fails
-instead of being followed. Source/output trees must be disjoint. Applications
-declare an `InitialPlan`: initial work and a
+The source policy is checked before stat or descent, including excluded
+directory subtrees. Child symlinks and other unsupported entries are excluded
+from this scan. A source-root symlink is unsupported and fails instead of being
+followed. Source/output trees must be disjoint. Applications declare an
+`InitialPlan`: initial work and a
 final publication Effect. Each handler returns required cascade work. The
 engine drains that work before final publication. Applications keep domain
 classification, extraction, rendering, path projection and publication rules.
 `includeSource(relativePath)` is an optional application policy. The engine
-checks it before stat or descent, including excluded directory subtrees.
-Without that policy, regular source names are unrestricted.
+checks it before stat or descent. Without that policy, regular source names are
+unrestricted.
 
 `openSynchronization(options)` runs the same initial pass and returns a scoped
 `Synchronization`, compatible with `WorkScheduler`. Keep it inside `Effect.scoped`; its output lease remains held
@@ -92,17 +94,26 @@ a shared output mount alone does not share a sibling on another filesystem.
 `observeSourcePath(sourcePath, relativePath, fs?)` is a point observation: it
 checks one relative path and returns present or confirmed absence. Missing or
 unreadable source roots fail with `SourceObservationFailed`; a source-root
-symlink is unsupported and fails. Absent children require a successful parent
+symlink is unsupported and fails. A child symlink or other unsupported child
+entry fails with `SourceObservationFailed` and the typed
+`reason: "unsupported-path"`; `path`, `cause` and `message` remain available
+for existing consumers. Root availability/read failures and incomplete parent
+reads do not receive that reason. Absent children require a successful parent
 read, or a regular-file ancestor, and a valid root. Symlink paths are excluded
 from source authority. `readSourceDirectory` preserves read errors.
 The optional `SourceFileSystem` is an external read-only fault-injection boundary.
 
 `removeAssociatedOutputs({ sourcePath, outputPath, statePath?, sourceRelativePath,
 outputs }, fs?)` rechecks absence before removing application-declared relative
-outputs. A stale hint returns false. Cleanup rejects root removal, traversal,
-absolute projections, symlink ancestors and overlap with configured engine state.
-Run it inside the owning session. The application returns required publication
-cascades after removal. No object identity persists across source moves.
+outputs. Only a successful observation returning `state: "absent"` supplies
+source authority for cleanup. Observation failures, including
+`reason: "unsupported-path"`, unavailable or unreadable roots, and incomplete
+parent reads, retain outputs. A stale hint returns false. Cleanup rejects root
+removal, traversal, absolute projections, symlink ancestors and overlap with
+configured engine state; those projection failures also cannot authorize
+cleanup. Run it inside the owning session. The application returns required
+publication cascades after removal. No object identity persists across source
+moves.
 
 The exact `effect@4.0.1` peer keeps one runtime identity. The tarball ships
 TypeScript source for Bun; it contains neither node_modules nor bundled Effect.

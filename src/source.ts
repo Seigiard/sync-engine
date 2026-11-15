@@ -29,6 +29,7 @@ export class SourceObservationFailed extends Data.TaggedError("SourceObservation
   readonly path: string;
   readonly cause: unknown;
   readonly message: string;
+  readonly reason?: "unsupported-path";
 }> {}
 
 export class OutputCleanupFailed extends Data.TaggedError("OutputCleanupFailed")<{
@@ -47,6 +48,19 @@ function confinedPath(root: string, path: string, allowRoot = false): string {
 
 const isMissing = (cause: unknown) => cause instanceof Error && "code" in cause && cause.code === "ENOENT";
 const message = (cause: unknown) => cause instanceof Error ? cause.message : String(cause);
+const unsupportedPathMarker = Symbol("unsupported-source-path");
+const unsupportedSourcePath = () => {
+  const cause = new Error("Unsupported source path");
+  Object.defineProperty(cause, unsupportedPathMarker, { value: true });
+  return cause;
+};
+const isUnsupportedSourcePath = (cause: unknown) => cause instanceof Error && Object.hasOwn(cause, unsupportedPathMarker);
+const observationFailure = (path: string, cause: unknown) => new SourceObservationFailed({
+  path,
+  cause,
+  message: message(cause),
+  ...(isUnsupportedSourcePath(cause) ? { reason: "unsupported-path" as const } : {}),
+});
 
 /** Confirm ancestors and root authority; a missing/unreadable root never means mass deletion. */
 export function observeSourcePath(sourcePath: string, path: string, fs: SourceFileSystem = nativeSourceFileSystem): Effect.Effect<SourceObservation, SourceObservationFailed> {
@@ -75,7 +89,7 @@ export function observeSourcePath(sourcePath: string, path: string, fs: SourceFi
           await confirmRoot();
           return { state: "absent" };
         }
-        if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw new Error("Unsupported source path");
+        if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw unsupportedSourcePath();
         if (current !== target && info.isFile()) {
           await confirmRoot();
           return { state: "absent" };
@@ -83,17 +97,17 @@ export function observeSourcePath(sourcePath: string, path: string, fs: SourceFi
       }
       return { state: "present", entry: { path: relative(root, target), kind: info.isDirectory() ? "directory" : "file", size: info.size, mtimeMs: info.mtimeMs } };
     },
-    catch: (cause) => new SourceObservationFailed({ path: join(sourcePath, path), cause, message: message(cause) }),
+    catch: (cause) => observationFailure(join(sourcePath, path), cause),
   }).pipe(Effect.uninterruptible);
 }
 
 /** Read errors stay failures, including ENOENT after a prior successful observation. */
 export function readSourceDirectory(sourcePath: string, path: string, fs: SourceFileSystem = nativeSourceFileSystem): Effect.Effect<readonly string[], SourceObservationFailed> {
   return observeSourcePath(sourcePath, path, fs).pipe(Effect.flatMap((observation) => {
-    if (observation.state === "absent" || observation.entry.kind !== "directory") return Effect.fail(new SourceObservationFailed({ path: join(sourcePath, path), cause: "Not an observable source directory", message: "Not an observable source directory" }));
+    if (observation.state === "absent" || observation.entry.kind !== "directory") return Effect.fail(observationFailure(join(sourcePath, path), "Not an observable source directory"));
     return Effect.tryPromise({
       try: () => fs.readdir(join(sourcePath, path)),
-      catch: (cause) => new SourceObservationFailed({ path: join(sourcePath, path), cause, message: message(cause) }),
+      catch: (cause) => observationFailure(join(sourcePath, path), cause),
     }).pipe(Effect.uninterruptible);
   }));
 }
