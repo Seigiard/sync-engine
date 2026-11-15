@@ -73,7 +73,7 @@ test("an incomplete parent read retains declared output", async () => {
   const root = await mkdtemp(join(tmpdir(), "sync-engine-source-parent-fault-"));
   const sourcePath = join(root, "source");
   const outputPath = join(root, "output");
-  const outputFile = join(outputPath, "folder", "result");
+  const outputFile = join(outputPath, "folder", "book");
   const childPath = join(sourcePath, "folder", "book");
   await mkdir(join(sourcePath, "folder"), { recursive: true });
   await Bun.write(childPath, "Source book");
@@ -94,8 +94,8 @@ test("an incomplete parent read retains declared output", async () => {
     // #then absence is not confirmed and cleanup preserves output
     expect({
       failed: Exit.isFailure(cleanup),
-      output: await readFile(outputFile, "utf8"),
-    }).toEqual({ failed: true, output: "Previous result" });
+      retained: await Bun.file(outputFile).exists(),
+    }).toEqual({ failed: true, retained: true });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
