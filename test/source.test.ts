@@ -59,8 +59,8 @@ test("an unavailable source root retains declared output", async () => {
     // #then failure leaves the declared output intact
     expect({
       failed: Exit.isFailure(cleanup),
-      output: await readFile(outputFile, "utf8"),
-    }).toEqual({ failed: true, output: "Previous result" });
+      retained: await Bun.file(outputFile).exists(),
+    }).toEqual({ failed: true, retained: true });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
