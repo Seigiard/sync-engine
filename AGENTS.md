@@ -27,10 +27,12 @@ Manual checks:
 - `bun test/shared-mount-check.ts` runs on the host and drives containers that share one volume, to prove the lease holds across containers. It uses the compose image `${COMPOSE_PROJECT_NAME}-engine-test` (default project `opds49-52`); build the image under the same project name first.
 - `bun scripts/verify-pack.ts` verifies the packed tarball from a clean checkout. Run it before a release.
 
+Before changing publication or releasing a version, read `docs/releases.md` for the staged-publishing procedure and its verification criteria.
+
 ## Architecture
 
-- `src/index.ts` is the public entry and the initial pass (`openSynchronization`). It builds on `ownership.ts` (lease, state area), `work.ts` (scheduler) and `freshness.ts` (retained results), and re-exports `source.ts` (observation, output cleanup).
-- `src/internal.ts` re-types `openSynchronization` with hidden hooks (`deferCommit`, `beforeCommit`) for `live.ts`. The package entry keeps them private.
+- `src/index.ts` is the public entry. `openSynchronization` composes the internal opening with its initial freshness commit, while `runInitialPass` scopes it. It builds on `ownership.ts` (lease, state area), `work.ts` (scheduler) and `freshness.ts` (retained results), and re-exports `source.ts` (observation, output cleanup).
+- `src/internal.ts` owns the type-checked two-phase opening: validation, lease, scan, declaration, minimum/required work and publication, followed by a synchronization handle whose completion only drains later work and an explicit freshness commit. `src/source-snapshot.ts` owns `SourceEntry` and `differences`; `src/source-scan.ts` owns native scanning and `ScanFailed`; `src/initial-pass.ts` holds the shared opening contracts. Public and live callers compose the commit operation.
 - `effect` is an exact peer (`4.0.1`) so consumers share one runtime identity. Keep the dev and peer versions equal.
 
 ### Live session: pure reducer + interpreter

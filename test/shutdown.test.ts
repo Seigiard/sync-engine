@@ -3,9 +3,10 @@ import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Cause, Effect, Exit } from "effect";
-import { openLiveSynchronization, type LiveSynchronization } from "../src/index.ts";
+import { openLiveSynchronization, openSynchronization, type LiveSynchronization } from "../src/index.ts";
 
 const io = <A>(run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: (cause) => new Error(String(cause)) }).pipe(Effect.uninterruptible);
+type BoundCleanup = (outputs: readonly string[]) => Effect.Effect<boolean, Error>;
 
 test("scope shutdown closes pass admission before awaiting a started publication and restart replays it", async () => {
   // #given a published source held after a write, before successful completion
@@ -99,6 +100,70 @@ test("shutdown during initial traversal leaves prior output intact and releases 
       interrupted: true, before: "Previous publication", after: "Current nested source",
     });
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("shutdown joins an admitted cleanup handler before releasing output ownership", async () => {
+  // #given a later handler admitted by a live session but held before its cleanup boundary
+  const root = await mkdtemp(join(tmpdir(), "sync-stop-cleanup-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const obsoleteOutput = join(outputPath, "obsolete");
+  await mkdir(sourcePath);
+  await mkdir(outputPath);
+  await Bun.write(obsoleteOutput, "Obsolete result");
+  const opened = Promise.withResolvers<LiveSynchronization<string, Error>>();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let later = false;
+  let removed: boolean | undefined;
+  const options = {
+    sourcePath, outputPath,
+    declare: () => Effect.succeed({ work: ["cleanup"], publish: Effect.void }),
+    handle: (_work: string, cleanup?: BoundCleanup) => Effect.gen(function* () {
+      if (!later) return [];
+      yield* Effect.sync(() => entered.resolve());
+      yield* io(() => release.promise);
+      removed = yield* (cleanup?.(["obsolete"]) ?? Effect.succeed(false));
+      return [];
+    }).pipe(Effect.uninterruptible),
+  };
+  const controller = new AbortController();
+  const running = Effect.runPromiseExit(Effect.scoped(Effect.gen(function* () {
+    const session = yield* openLiveSynchronization(options);
+    opened.resolve(session);
+    yield* Effect.never;
+  })), { signal: controller.signal });
+  try {
+    const session = await opened.promise;
+    later = true;
+    await Effect.runPromise(session.requestPass({ force: true }));
+    await entered.promise;
+    // #when shutdown closes future admission while the admitted handler still owns cleanup
+    controller.abort();
+    await Bun.sleep(25);
+    const during = await Effect.runPromise(session.requestPass());
+    release.resolve();
+    const exit = await running;
+    later = false;
+    await Effect.runPromise(Effect.scoped(openSynchronization(options)));
+    // #then cleanup finishes before the released lease permits a new owner
+    expect({
+      during,
+      removed,
+      obsoleteExists: await Bun.file(obsoleteOutput).exists(),
+      interrupted: Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause),
+    }).toEqual({
+      during: "rejected",
+      removed: true,
+      obsoleteExists: false,
+      interrupted: true,
+    });
+  } finally {
+    release.resolve();
+    controller.abort();
+    await running;
     await rm(root, { recursive: true, force: true });
   }
 });

@@ -1,0 +1,3 @@
+import { differences } from "./source-snapshot.ts";
+
+export const fixture = differences;

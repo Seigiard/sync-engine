@@ -3,7 +3,103 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink } from "node:fs/p
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Effect, Exit } from "effect";
-import { engineStatePath, observeSourcePath, openSynchronization, readSourceDirectory, removeAssociatedOutputs } from "../src/index.ts";
+import { engineStatePath, observeSourcePath, openSynchronization, readSourceDirectory, removeAssociatedOutputs, type SourceFileSystem } from "../src/index.ts";
+
+type BoundCleanup = (outputs: readonly string[]) => Effect.Effect<boolean, Error>;
+
+test("a child symlink exposes unsupported-path while retaining legacy observation fields", async () => {
+  // #given a real source child symlink
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-source-symlink-"));
+  const sourcePath = join(root, "source");
+  const childPath = join(sourcePath, "child");
+  await mkdir(sourcePath);
+  await symlink(join(root, "target"), childPath);
+  try {
+    // #when the public observer reads the unsupported child
+    const failure = await Effect.runPromise(observeSourcePath(sourcePath, "child").pipe(Effect.match({
+      onFailure: (failure) => ({
+        reason: (failure as { readonly reason?: "unsupported-path" }).reason,
+        path: failure.path,
+        cause: failure.cause instanceof Error ? { name: failure.cause.name, message: failure.cause.message } : failure.cause,
+        message: failure.message,
+      }),
+      onSuccess: () => undefined,
+    })));
+    // #then consumers receive a stable classification without losing legacy fields
+    expect(failure).toEqual({
+      reason: "unsupported-path",
+      path: childPath,
+      cause: { name: "Error", message: "Unsupported source path" },
+      message: "Unsupported source path",
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an unavailable source root retains declared output", async () => {
+  // #given a real output and an external root-stat read fault
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-source-root-fault-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const outputFile = join(outputPath, "gone", "result");
+  await mkdir(sourcePath);
+  await mkdir(join(outputPath, "gone"), { recursive: true });
+  await Bun.write(outputFile, "Previous result");
+  const fault: SourceFileSystem = {
+    lstat: async (path) => {
+      if (path === sourcePath) throw Object.assign(new Error("Unreadable source root"), { code: "EACCES" });
+      return lstat(path);
+    },
+    readdir,
+  };
+  try {
+    // #when cleanup cannot establish source-root authority
+    const cleanup = await Effect.runPromiseExit(removeAssociatedOutputs({
+      sourcePath, outputPath, sourceRelativePath: "gone", outputs: ["gone"],
+    }, fault));
+    // #then failure leaves the declared output intact
+    expect({
+      failed: Exit.isFailure(cleanup),
+      retained: await Bun.file(outputFile).exists(),
+    }).toEqual({ failed: true, retained: true });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an incomplete parent read retains declared output", async () => {
+  // #given a real source child and an external child-stat read fault
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-source-parent-fault-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const outputFile = join(outputPath, "folder", "book");
+  const childPath = join(sourcePath, "folder", "book");
+  await mkdir(join(sourcePath, "folder"), { recursive: true });
+  await Bun.write(childPath, "Source book");
+  await mkdir(join(outputPath, "folder"), { recursive: true });
+  await Bun.write(outputFile, "Previous result");
+  const fault: SourceFileSystem = {
+    lstat: async (path) => {
+      if (path === childPath) throw Object.assign(new Error("Missing during read"), { code: "ENOENT" });
+      return lstat(path);
+    },
+    readdir,
+  };
+  try {
+    // #when the parent listing contradicts the failed child stat
+    const cleanup = await Effect.runPromiseExit(removeAssociatedOutputs({
+      sourcePath, outputPath, sourceRelativePath: "folder/book", outputs: ["folder/book"],
+    }, fault));
+    // #then absence is not confirmed and cleanup preserves output
+    expect({
+      failed: Exit.isFailure(cleanup),
+      retained: await Bun.file(outputFile).exists(),
+    }).toEqual({ failed: true, retained: true });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("an incomplete source observation retains results but confirmed removal permits associated cleanup", async () => {
   // #given real trees and an external directory-read fault
@@ -66,11 +162,12 @@ test("cleanup rejects traversal, root removal and symlink ancestors without touc
     // #when the public cleanup API receives unsafe application projections
     const failures = [];
     for (const outputs of [["../user"], [""], ["alias/keep"], [join(root, "user")]]) {
-      failures.push(Exit.isFailure(await Effect.runPromiseExit(removeAssociatedOutputs({ sourcePath, outputPath, sourceRelativePath: "gone", outputs }))));
+      const cleanup = await Effect.runPromiseExit(removeAssociatedOutputs({ sourcePath, outputPath, sourceRelativePath: "gone", outputs }));
+      failures.push(Exit.isFailure(cleanup) ? cleanup.cause.reasons.map((reason) => reason._tag === "Fail" ? reason.error._tag : reason._tag) : []);
     }
     const missingRoot = await Effect.runPromiseExit(removeAssociatedOutputs({ sourcePath: join(root, "missing"), outputPath, sourceRelativePath: "gone", outputs: ["keep"] }));
     // #then neither incomplete authority nor unsafe declarations remove useful files
-    expect({ failures, missingRoot: Exit.isFailure(missingRoot), user: await readFile(join(root, "user", "keep"), "utf8"), unrelated: await readFile(join(outputPath, "keep"), "utf8") }).toEqual({ failures: [true, true, true, true], missingRoot: true, user: "User data", unrelated: "Unrelated output" });
+    expect({ failures, missingRoot: Exit.isFailure(missingRoot), user: await readFile(join(root, "user", "keep"), "utf8"), unrelated: await readFile(join(outputPath, "keep"), "utf8") }).toEqual({ failures: [["OutputCleanupFailed"], ["OutputCleanupFailed"], ["OutputCleanupFailed"], ["OutputCleanupFailed"]], missingRoot: true, user: "User data", unrelated: "Unrelated output" });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -116,6 +213,60 @@ test("explicit in-output bookkeeping shares canonical aliases and is excluded fr
     const cleanup = await Effect.runPromiseExit(removeAssociatedOutputs({ sourcePath, outputPath, statePath, sourceRelativePath: "gone", outputs: [".sync-engine"] }));
     // #then configuration preserves canonical identity and protects the state itself
     expect({ canonical, rejected: Exit.isFailure(cleanup), saved: await readFile(join(statePath, "saved"), "utf8") }).toEqual({ canonical: statePath, rejected: true, saved: "Persistent engine state" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("session-bound cleanup validates every projection before removing any declared output", async () => {
+  // #given a session-owned output tree with one safe projection and several unsafe declarations
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-bound-cleanup-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const statePath = join(outputPath, ".sync-engine");
+  const safeFile = join(outputPath, "safe", "result");
+  const outsideFile = join(root, "outside", "result");
+  await mkdir(sourcePath);
+  await mkdir(join(outputPath, "safe"), { recursive: true });
+  await mkdir(join(root, "outside"), { recursive: true });
+  await mkdir(statePath);
+  await Bun.write(safeFile, "Safe projection");
+  await Bun.write(outsideFile, "Outside output");
+  await Bun.write(join(statePath, "saved"), "Engine state");
+  await symlink(join(root, "outside"), join(outputPath, "alias"));
+  const declarations = [
+    ["safe", "../outside"],
+    ["safe", ""],
+    ["safe", join(root, "outside")],
+    ["safe", "alias/result"],
+    ["safe", ".sync-engine"],
+  ] as const;
+  const rejected: boolean[] = [];
+  try {
+    // #when a handler requests bound cleanup for each unsafe complete declaration
+    await Effect.runPromise(Effect.scoped(openSynchronization({
+      sourcePath, outputPath, statePath,
+      declare: () => Effect.succeed({ work: ["cleanup"], publish: Effect.void }),
+      handle: (_work: string, cleanup?: BoundCleanup) => Effect.forEach(
+        declarations,
+        (outputs) => (cleanup?.(outputs) ?? Effect.succeed(false)).pipe(Effect.exit),
+      ).pipe(Effect.map((exits) => {
+        rejected.push(...exits.map(Exit.isFailure));
+        return [];
+      })),
+    })));
+    // #then each rejection preserves every previously declared projection and protected tree
+    expect({
+      rejected,
+      safe: await readFile(safeFile, "utf8"),
+      outside: await readFile(outsideFile, "utf8"),
+      state: await readFile(join(statePath, "saved"), "utf8"),
+    }).toEqual({
+      rejected: [true, true, true, true, true],
+      safe: "Safe projection",
+      outside: "Outside output",
+      state: "Engine state",
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Deferred, Effect, Exit, Scope } from "effect";
+import { Cause, Deferred, Effect, Exit, Scope } from "effect";
 import { createWorkScheduler, openSynchronization, runInitialPass } from "../src/index.ts";
 
 const io = <A>(run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: (cause) => new Error(String(cause)) }).pipe(Effect.uninterruptible);
@@ -327,6 +327,39 @@ test("key callback defects fail the scheduler instead of hanging completion", as
   })));
   // #then completion fails and pending work is cleared
   expect(result).toEqual({ submitFailed: true, failed: true, state: "failed", pending: 0 });
+});
+
+test("a successful retry clears its failure identity while preserving an independent error", async () => {
+  // #given two failed identities and a retry with a different pending key
+  const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const scheduler = yield* createWorkScheduler<string, string, never>({
+      key: (work) => work,
+      failureKey: (work) => work.split(":")[0],
+      handle: (work) => work === "a:retry" ? Effect.succeed([]) : Effect.fail(work),
+    });
+    const snapshot = scheduler.status.pipe(Effect.map(({ state, pending, active, errors }) => ({
+      state, pending, active,
+      errors: errors.map(({ work, cause }) => ({ work, error: Cause.squash(cause) })),
+    })));
+    yield* scheduler.submit(["a:first", "b:first"]);
+    yield* scheduler.awaitCompletion;
+    const before = yield* snapshot;
+    // #when a new request successfully retries only identity a
+    yield* scheduler.submit(["a:retry"]);
+    yield* scheduler.awaitCompletion;
+    return { before, after: yield* snapshot };
+  })));
+  // #then identity b remains observable after the retry drains
+  expect(result).toEqual({
+    before: {
+      state: "complete-with-errors", pending: 0, active: null,
+      errors: [{ work: "a:first", error: "a:first" }, { work: "b:first", error: "b:first" }],
+    },
+    after: {
+      state: "complete-with-errors", pending: 0, active: null,
+      errors: [{ work: "b:first", error: "b:first" }],
+    },
+  });
 });
 
 test("failureKey callback defects fail the scheduler instead of hanging completion", async () => {

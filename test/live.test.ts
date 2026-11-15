@@ -156,6 +156,68 @@ test("a failed later publication does not record freshness for unpublished outpu
   }
 });
 
+test("a recovered live pass retains output after its failed handler and publication", async () => {
+  // #given a retained result and a later pass whose handler and publication both fail
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-recovered-freshness-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  await Bun.write(join(sourcePath, "note.txt"), "Initial");
+  const handled: string[] = [];
+  let failHandler = false;
+  let failPublish = false;
+  const options = {
+    sourcePath,
+    outputPath,
+    reconcileIntervalMs: 0,
+    freshness: { describe: () => ({ sourcePaths: ["note.txt"], resultKind: "note", processingVersion: "v1", outputPaths: ["published.txt"] }) },
+    declare: () => Effect.succeed({
+      work: ["note"],
+      publish: failPublish ? Effect.fail(new Error("publish failed")) : Effect.void,
+    }),
+    handle: () => io(() => readFile(join(sourcePath, "note.txt"), "utf8")).pipe(Effect.flatMap((text) => {
+      handled.push(text);
+      return failHandler
+        ? Effect.fail(new Error("handler failed"))
+        : io(async () => {
+            await Bun.write(join(outputPath, "published.txt"), `Published: ${text}`);
+            return [] as string[];
+          });
+    })),
+  };
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* openLiveSynchronization(options);
+      yield* io(() => Bun.write(join(sourcePath, "note.txt"), "Failed"));
+      failHandler = true;
+      failPublish = true;
+      yield* session.requestPass();
+      const failed = yield* Effect.exit(session.awaitCompletion);
+      yield* io(() => Bun.write(join(sourcePath, "note.txt"), "Recovered"));
+      failHandler = false;
+      failPublish = false;
+      yield* session.requestPass();
+      yield* session.awaitCompletion;
+      // #when an unchanged pass and a fresh session follow the recovered pass
+      yield* session.requestPass();
+      yield* session.awaitCompletion;
+      return {
+        failed: Exit.isFailure(failed),
+        published: yield* io(() => readFile(join(outputPath, "published.txt"), "utf8")),
+      };
+    })));
+    await Effect.runPromise(runInitialPass(options));
+    // #then both reuse the recovered output without another handler execution
+    expect({ ...result, handled }).toEqual({
+      failed: true,
+      published: "Published: Recovered",
+      handled: ["Initial", "Failed", "Recovered"],
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("combined requests during processing preserve a forced repair of unchanged sources", async () => {
   // #given two real sources and a previously published representation
   const root = await mkdtemp(join(tmpdir(), "sync-engine-forced-"));
@@ -1415,6 +1477,81 @@ test("notify during the after-initial opening window invalidates the opening com
   }
 });
 
+test("a delayed watcher invalidation retargets a replacement opening before restart", async () => {
+  // #given a retained equal-metadata record, a paused watcher admission, and a recoverable replacement opening
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-retarget-invalidation-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const stamp = new Date("2020-01-01T00:00:00Z");
+  const firstOpening = gate();
+  const releaseFirstOpening = gate();
+  const secondOpening = gate();
+  const releaseSecondOpening = gate();
+  const invalidated = gate();
+  const releaseAdmission = gate();
+  let pauseAdmission = true;
+  let openings = 0;
+  const options = {
+    sourcePath,
+    outputPath,
+    reconcileIntervalMs: 0,
+    freshness: { describe: () => ({ sourcePaths: ["note.txt"], resultKind: "note", processingVersion: "v1", outputPaths: ["note.txt"] }) },
+    declare: (_entries: unknown, request: { readonly kind: string }) => request.kind === "resync"
+      ? Effect.fail(new Error("stop before resync submit"))
+      : Effect.succeed({ work: ["note.txt"], publish: Effect.void }),
+    handle: (path: string) => io(async () => { await Bun.write(join(outputPath, path), await readFile(join(sourcePath, path), "utf8")); return [] as string[]; }),
+  };
+  const initialOptions = { ...options, declare: () => Effect.succeed({ work: ["note.txt"], publish: Effect.void }) };
+  try {
+    await mkdir(sourcePath);
+    await Bun.write(join(sourcePath, "note.txt"), "Original");
+    await utimes(join(sourcePath, "note.txt"), stamp, stamp);
+    await Effect.runPromise(runInitialPass(initialOptions));
+    const scope = await Effect.runPromise(Scope.make());
+    const session = await Effect.runPromise(startLiveSynchronizationWithHooks({ ...options, recovery: { existing: Effect.succeed(true) } }, {
+      afterOpeningPublication: io(async () => {
+        openings += 1;
+        if (openings === 1) {
+          firstOpening.open();
+          await releaseFirstOpening.promise;
+          throw new Error("fail attempt A");
+        }
+        secondOpening.open();
+        await releaseSecondOpening.promise;
+      }).pipe(Effect.orDie),
+      afterRequestInvalidation: io(async () => {
+        if (!pauseAdmission) return;
+        pauseAdmission = false;
+        invalidated.open();
+        await releaseAdmission.promise;
+      }).pipe(Effect.orDie),
+    }).pipe(Scope.provide(scope))) as LiveHandle<string, Error>;
+    await firstOpening.promise;
+    const watcher = Effect.runPromise(session.notify(["note.txt"]));
+    await invalidated.promise;
+    const followUp = await Effect.runPromise(session.requestPass());
+    releaseFirstOpening.open();
+    await secondOpening.promise;
+    await Bun.write(join(sourcePath, "note.txt"), "Changed!");
+    await utimes(join(sourcePath, "note.txt"), stamp, stamp);
+    releaseAdmission.open();
+    const watcherAdmission = await watcher;
+    releaseSecondOpening.open();
+    const completion = await Effect.runPromise(Effect.exit(session.awaitCompletion));
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    await Effect.runPromise(runInitialPass(initialOptions));
+    // #when attempt B commits after the delayed watcher request retargets its freshness and its follow-up stops before submit
+    const result = { followUp, watcherAdmission, completionFailed: Exit.isFailure(completion), output: await readFile(join(outputPath, "note.txt"), "utf8") };
+    // #then restart reprocesses the equal-metadata replacement instead of trusting B's stale retained record
+    expect(result).toEqual({ followUp: "queued", watcherAdmission: "queued", completionFailed: true, output: "Changed!" });
+  } finally {
+    releaseFirstOpening.open();
+    releaseSecondOpening.open();
+    releaseAdmission.open();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("notify during active work prevents the active stale read from being retained", async () => {
   // #given retained metadata freshness and a force pass held after reading the old source
   const root = await mkdtemp(join(tmpdir(), "sync-engine-live-active-notify-"));
@@ -1861,6 +1998,46 @@ test("a later pass's resources are released only after the scheduler stopped the
       return { failed: Exit.isFailure(completion), order: [...order] };
     })));
     // #then the running handler is stopped before the resource it may use is released
+    expect(result).toEqual({ failed: true, order: ["handler stopped", "pass resource released"] });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  ["defect", () => Effect.die("handler defect")],
+  ["self-interruption", () => Effect.interrupt],
+] as const)("a later pass with null work releases resources only after a handler stops when another worker ends by %s", async (_ending, endWorker) => {
+  // #given two workers: a null handler is still running when the other worker ends the attempt
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-live-null-pass-order-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  await mkdir(sourcePath);
+  const order: string[] = [];
+  const running = gate();
+  try {
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* openLiveSynchronization({
+        sourcePath,
+        outputPath,
+        concurrency: 2,
+        reconcileIntervalMs: 0,
+        recovery: { existing: Effect.succeed(true) },
+        declare: (_entries, request) => request.kind === "initial"
+          ? Effect.succeed({ work: [] as Array<string | null>, publish: Effect.void })
+          : Effect.acquireRelease(Effect.void, () => Effect.sync(() => { order.push("pass resource released"); }))
+            .pipe(Effect.as({ work: [null, "ends"] as Array<string | null>, publish: Effect.void })),
+        handle: (work: string | null) => {
+          if (work === null) return Effect.sync(() => running.open()).pipe(Effect.andThen(Effect.never), Effect.onInterrupt(() => Effect.sync(() => { order.push("handler stopped"); })));
+          return Effect.promise(() => running.promise).pipe(Effect.andThen(endWorker()));
+        },
+      });
+      // #when the scheduler ends the attempt while the null handler is in flight
+      yield* session.requestPass();
+      const completion = yield* Effect.exit(session.awaitCompletion);
+      return { failed: Exit.isFailure(completion), order: [...order] };
+    })));
+    // #then the null handler is stopped before the pass resource it may use is released
     expect(result).toEqual({ failed: true, order: ["handler stopped", "pass resource released"] });
   } finally {
     await rm(root, { recursive: true, force: true });

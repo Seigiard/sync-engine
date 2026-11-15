@@ -40,6 +40,45 @@ test("a new engine instance reuses a successfully published result without rewri
   }
 });
 
+test("a literal pre-refactor retained state reuses an unchanged output without running its handler", async () => {
+  // #given separately written source/output artifacts and a pre-refactor retained-state record
+  const root = await mkdtemp(join(tmpdir(), "sync-freshness-legacy-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const statePath = join(root, "state");
+  const retainedRecord = "{\"[\\\"text\\\",[\\\"note.txt\\\"]]\":\"[\\\"v1\\\",\\\"metadata\\\",[[\\\"note.txt\\\",15,1577836800000,null]]]\"}";
+  let handled = 0;
+  await mkdir(sourcePath);
+  await mkdir(outputPath);
+  await mkdir(statePath);
+  await Bun.write(join(sourcePath, "note.txt"), "Original source");
+  await utimes(join(sourcePath, "note.txt"), ancient, ancient);
+  await Bun.write(join(outputPath, "note"), "Published: Original source");
+  await utimes(join(outputPath, "note"), ancient, ancient);
+  await Bun.write(join(statePath, "freshness.json"), retainedRecord);
+  try {
+    // #when a new engine instance opens the unchanged persisted state
+    await Effect.runPromise(runInitialPass({
+      sourcePath,
+      outputPath,
+      statePath,
+      declare: () => Effect.succeed({ work: ["note"], publish: Effect.void }),
+      freshness: {
+        describe: () => ({ sourcePaths: ["note.txt"], resultKind: "text", processingVersion: "v1", outputPaths: ["note"] }),
+      },
+      handle: () => Effect.sync(() => {
+        handled += 1;
+        return [] as string[];
+      }),
+    }));
+    // #then the independent artifact remains untouched and no work is repeated
+    expect({ handled, outputMtime: (await stat(join(outputPath, "note"))).mtimeMs })
+      .toEqual({ handled: 0, outputMtime: ancient.getTime() });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 async function textTree() {
   const root = await mkdtemp(join(tmpdir(), "sync-text-freshness-"));
   const sourcePath = join(root, "source");
@@ -252,6 +291,69 @@ test("work whose declared source disappeared reaches its handler instead of fail
     }).pipe(Effect.as("completed"), Effect.catchTag("FreshnessFailed", () => Effect.succeed("freshness failed"))));
     // #then absence is the handler's to confirm: it ran, and the pass did not fail on the missing stamp
     expect({ outcome, handled, output: await Bun.file(join(outputPath, "note")).exists() }).toEqual({ outcome: "completed", handled: ["note"], output: false });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("malformed retained state is exposed as FreshnessFailed", async () => {
+  // #given a state file whose top-level value is invalid under the retained-state protocol
+  const root = await mkdtemp(join(tmpdir(), "sync-freshness-malformed-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const statePath = join(root, "state");
+  await mkdir(sourcePath);
+  await mkdir(outputPath);
+  await mkdir(statePath);
+  await Bun.write(join(statePath, "freshness.json"), "[]");
+  try {
+    // #when freshness initializes from that state
+    const result = await Effect.runPromise(openFreshness({
+      sourcePath,
+      outputPath,
+      freshness: { describe: () => undefined },
+      handle: () => Effect.succeed([] as string[]),
+    }, statePath).pipe(
+      Effect.as("opened"),
+      Effect.catchTag("FreshnessFailed", () => Effect.succeed("freshness failed")),
+    ));
+    // #then callers receive the documented typed failure
+    expect(result).toBe("freshness failed");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a dirty retained record is saved before its handler observes the state file", async () => {
+  // #given a stale retained record for otherwise real source/output roots
+  const root = await mkdtemp(join(tmpdir(), "sync-freshness-dirty-before-handler-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const statePath = join(root, "state");
+  const staleRecord = "{\"[\\\"text\\\",[\\\"note.txt\\\"]]\":\"[\\\"v1\\\",\\\"metadata\\\",[[\\\"note.txt\\\",15,0,null]]]\"}";
+  await mkdir(sourcePath);
+  await mkdir(outputPath);
+  await mkdir(statePath);
+  await Bun.write(join(sourcePath, "note.txt"), "Original source");
+  await utimes(join(sourcePath, "note.txt"), ancient, ancient);
+  await Bun.write(join(statePath, "freshness.json"), staleRecord);
+  try {
+    // #when processing starts for the stale record
+    const stateAtHandler = await Effect.runPromise(Effect.gen(function* () {
+      const freshness = yield* openFreshness({
+        sourcePath,
+        outputPath,
+        freshness: {
+          describe: () => ({ sourcePaths: ["note.txt"], resultKind: "text", processingVersion: "v1", outputPaths: ["note"] }),
+        },
+        handle: () => io(async () => {
+          return [await readFile(join(statePath, "freshness.json"), "utf8")] as string[];
+        }),
+      }, statePath);
+      return yield* freshness.handle("note");
+    }));
+    // #then the handler sees the dirty record removed from persisted state
+    expect(stateAtHandler).toEqual(["{}"]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

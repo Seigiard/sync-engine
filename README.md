@@ -8,22 +8,54 @@ Repository identity: `Seigiard/sync-engine`.
 The library owns synchronization mechanisms. Applications own domain processing and publication requirements.
 Bun on Linux/Docker and Effect 4 are the supported execution boundary.
 
+For release notes, see the [changelog](https://github.com/Seigiard/sync-engine/blob/main/CHANGELOG.md).
+For consumers updating from `0.5.6`, see the
+[version-update guide](https://github.com/Seigiard/sync-engine/blob/main/docs/upgrading.md).
+
+## Pure live-session check
+
+`bun run test:pure` runs the complete bounded-exhaustive live-session model
+check directly on the host at the supported depth (`LIVE_MODEL_DEPTH=10` by
+default). It selects only `test/live-machine.test.ts` and does not require
+Linux `flock`.
+
+`bun test` runs the full integration suite. Its output lease requires Linux
+`flock` from util-linux, so run it with
+`docker compose -f docker-compose.test.yml run --rm --build engine-test`.
+`bun run check:pure-modules` validates that `src/live-machine.ts` (the
+live-session reducer), `src/source-snapshot.ts` (the source snapshot), and
+`src/freshness-codec.ts` (the freshness codec) keep runtime and I/O
+dependencies out of their pure-module boundaries.
+
 ## Initial pass and scheduler
 
 `runInitialPass({ sourcePath, outputPath, declare, handle })` returns an Effect.
-It scans regular source paths and directories, with relative path identity,
-size and modification time. Source symlinks are excluded. Source/output trees
-must be disjoint. Applications declare an `InitialPlan`: initial work and a
+Its full source scan accepts a real directory root and traverses regular source
+paths and directories, with relative path identity, size and modification time.
+The source policy is checked before stat or descent, including excluded
+directory subtrees. Child symlinks and other unsupported entries are excluded
+from this scan. A source-root symlink is unsupported and fails instead of being
+followed. Source/output trees must be disjoint. Applications declare an
+`InitialPlan`: initial work and a
 final publication Effect. Each handler returns required cascade work. The
 engine drains that work before final publication. Applications keep domain
 classification, extraction, rendering, path projection and publication rules.
 `includeSource(relativePath)` is an optional application policy. The engine
-checks it before stat or descent, including excluded directory subtrees.
-Without that policy, regular source names are unrestricted.
+checks it before stat or descent. Without that policy, regular source names are
+unrestricted.
 
 `openSynchronization(options)` runs the same initial pass and returns a scoped
 `Synchronization`, compatible with `WorkScheduler`. Keep it inside `Effect.scoped`; its output lease remains held
 until the scope closes. `submit(work)` accepts subsequent application work.
+The handler receives a second `cleanup` argument. It is bound to the current
+session and accepts the complete list of application-selected output
+projections to remove. The engine validates every projection before removing
+any of them, rejects root, traversal, absolute, symlink-ancestor and state-area
+paths, and returns an Effect failure for an invalid declaration. The callback
+does not observe sources or choose projections; call it only after the
+application has authoritative evidence that the selected projections are
+obsolete. A callback captured from a handler fails after the session scope
+closes, and an admitted cleanup finishes before the output lease is released.
 After that scope closes, the returned handle rejects admission and completion
 without touching retained freshness.
 `awaitCompletion` waits for pending, active and handler-returned required work.
@@ -57,7 +89,7 @@ required-work failures remain visible in status, but final publication still run
 so consumers can keep serving prior successful results. All native filesystem Promise crossings are owned.
 
 `acquireOutputTree(outputPath, statePath?)` supplies the same lease to legacy consumers
-during migration. It returns an async release function. Effect consumers use
+during a version update. It returns an async release function. Effect consumers use
 `Effect.acquireRelease` in a scope; Promise consumers must release it after
 joining their work. Linux `flock` (`util-linux`) holds a persistent lock inode
 at `engineStatePath(outputPath, statePath?)/lock`. A handshake confirms ownership. Release closes stdin
@@ -74,18 +106,29 @@ All compositions that share an output must use the same canonical state area.
 Docker containers must mount that area on the same shared persistent filesystem;
 a shared output mount alone does not share a sibling on another filesystem.
 
-`observeSourcePath(sourcePath, relativePath, fs?)` returns present or confirmed
-absence. Missing or unreadable source roots fail with `SourceObservationFailed`.
-Absent children require a successful parent read, or a regular-file ancestor,
-and a valid root; symlink paths are excluded from source authority. `readSourceDirectory` preserves read errors.
+`observeSourcePath(sourcePath, relativePath, fs?)` is a point observation: it
+checks one relative path and returns present or confirmed absence. Missing or
+unreadable source roots fail with `SourceObservationFailed`; a source-root
+symlink is unsupported and fails. A child symlink or other unsupported child
+entry fails with `SourceObservationFailed` and the typed
+`reason: "unsupported-path"`; `path`, `cause` and `message` remain available
+for existing consumers. Root availability/read failures and incomplete parent
+reads do not receive that reason. Absent children require a successful parent
+read, or a regular-file ancestor, and a valid root. Symlink paths are excluded
+from source authority. `readSourceDirectory` preserves read errors.
 The optional `SourceFileSystem` is an external read-only fault-injection boundary.
 
 `removeAssociatedOutputs({ sourcePath, outputPath, statePath?, sourceRelativePath,
 outputs }, fs?)` rechecks absence before removing application-declared relative
-outputs. A stale hint returns false. Cleanup rejects root removal, traversal,
-absolute projections, symlink ancestors and overlap with configured engine state.
-Run it inside the owning session. The application returns required publication
-cascades after removal. No object identity persists across source moves.
+outputs. Only a successful observation returning `state: "absent"` supplies
+source authority for cleanup. Observation failures, including
+`reason: "unsupported-path"`, unavailable or unreadable roots, and incomplete
+parent reads, retain outputs. A stale hint returns false. Cleanup rejects root
+removal, traversal, absolute projections, symlink ancestors and overlap with
+configured engine state; those projection failures also cannot authorize
+cleanup. Run it inside the owning session. The application returns required
+publication cascades after removal. No object identity persists across source
+moves.
 
 The exact `effect@4.0.1` peer keeps one runtime identity. The tarball ships
 TypeScript source for Bun; it contains neither node_modules nor bundled Effect.
@@ -127,8 +170,11 @@ read from being recorded as current. `force: true` bypasses all retained freshne
 Returned required work invalidates its dependent result, so a changed upstream
 cannot shortcut the publication it requires.
 
-Dirty records are removed before processing. Only a completed successful batch
-records new freshness; a failure or interruption leaves work eligible for replay.
+Dirty records are removed before processing. Each live pass starts a new freshness
+batch and retires candidates and failure state left by an uncommitted pass. Only
+a completed successful batch records new freshness; a failure or interruption
+leaves work eligible for replay, while a later successful pass retains its own
+results.
 Sources are checked before/after processing and again at successful completion.
 The output lease serializes retained-state access. `FreshnessFailed` reports
 source/output-check and state-read/write failures. `openFreshness` is the adapter
@@ -166,9 +212,11 @@ bun scripts/verify-pack.ts <destination>
 `verify-pack.ts` fails on a dirty tree, a version or peer mismatch, an unexpected file, or any packed
 source/README file that differs from the checkout. For `package.json`, it checks package name,
 version and peer dependencies instead of byte equality. It prints the commit, archive path, size,
-SHA256 and the SHA512 integrity string a lockfile records. A release is the `npm publish` of that archive's checkout; verify
+SHA256 and the SHA512 integrity string a lockfile records. Verify
 the registry afterwards with `npm view @seigiard/sync-engine@<version> dist.integrity` and compare it to
-the printed integrity.
+the printed integrity. Submit the archive through the
+[staged release procedure](https://github.com/Seigiard/sync-engine/blob/main/docs/releases.md);
+the maintainer approves the staged candidate.
 
 Update a consumer in two steps. Development: copy the archive to the consumer's `vendor/` under a
 content-qualified name, depend on `file:vendor/<name>` and rebuild its images; Bun caches file
@@ -279,3 +327,10 @@ work through successful-only freshness. A write without recorded success is
 eligible for replay; application handlers must tolerate that replay. Cooperative
 shutdown preserves the handler's declared boundary, not atomic safety against
 SIGKILL, a shutdown deadline, or power loss at every intermediate write.
+
+## Releases
+
+The package is staged from a clean CI job without project dependencies, then approved by a maintainer with npm 2FA.
+For publication setup, archive verification, or a version release, follow the [staged release procedure](https://github.com/Seigiard/sync-engine/blob/main/docs/releases.md).
+For unreleased changes, read the [changelog](https://github.com/Seigiard/sync-engine/blob/main/CHANGELOG.md).
+For a consumer version update from `0.5.6`, read the [version-update guide](https://github.com/Seigiard/sync-engine/blob/main/docs/upgrading.md).

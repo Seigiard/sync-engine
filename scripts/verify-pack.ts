@@ -1,14 +1,17 @@
 /**
  * Packs the checkout and verifies the archive against it: identity, peer, exact inventory and byte equality.
  * Prints the archive path, size, SHA256 and the SHA512 integrity string a consumer's lockfile records.
- * Run it from a clean checkout: `bun scripts/verify-pack.ts [destination]`.
+ * Run it from a clean checkout: `node scripts/verify-pack.ts [destination]` (Node 24+), or use Bun.
  */
 import { createHash } from "node:crypto";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
-const root = resolve(import.meta.dir, "..");
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const destination = resolve(process.argv[2] ?? (await mkdtemp(join(tmpdir(), "sync-engine-pack-"))));
 const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8")) as {
   name: string;
@@ -16,14 +19,8 @@ const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8")) 
   peerDependencies?: Record<string, string>;
 };
 
-const run = async (command: string[], cwd: string) => {
-  const proc = Bun.spawn(command, { cwd, stdout: "pipe", stderr: "pipe" });
-  const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
-
-  if (code !== 0) throw new Error(`${command.join(" ")} exited ${code}: ${stderr}`);
-
-  return stdout;
-};
+const execute = promisify(execFile);
+const run = async ([command, ...args]: [string, ...string[]], cwd: string) => (await execute(command, args, { cwd })).stdout;
 
 const failures: string[] = [];
 const expect = (ok: boolean, message: string) => {
@@ -31,12 +28,13 @@ const expect = (ok: boolean, message: string) => {
 };
 
 const dirty = (await run(["git", "status", "--porcelain"], root)).trim();
-expect(dirty === "", `checkout is not clean:\n${dirty}`);
+if (dirty !== "") throw new Error(`checkout is not clean:\n${dirty}`);
 const commit = (await run(["git", "rev-parse", "HEAD"], root)).trim();
 
-await run(["bun", "pm", "pack", "--destination", destination], root);
+await mkdir(destination, { recursive: true });
+await run(["npm", "pack", "--ignore-scripts", "--pack-destination", destination], root);
 const archive = join(destination, `${manifest.name.replace("@", "").replace("/", "-")}-${manifest.version}.tgz`);
-const bytes = new Uint8Array(await Bun.file(archive).arrayBuffer());
+const bytes = await readFile(archive);
 const extracted = await mkdtemp(join(tmpdir(), "sync-engine-unpacked-"));
 
 try {

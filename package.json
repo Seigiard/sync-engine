@@ -1,7 +1,7 @@
 {
   "name": "@seigiard/sync-engine",
   "description": "Shared Effect 4 synchronization engine: source scans, required work, freshness, live passes and output ownership.",
-  "version": "0.5.5",
+  "version": "0.6.0",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
@@ -16,9 +16,11 @@
   },
   "scripts": {
     "check": "bun run lint && bun run typecheck && bun test",
+    "check:pure-modules": "bun scripts/check-pure-modules.ts",
     "lint": "oxlint --deny-warnings src test scripts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
+    "test:pure": "SYNC_ENGINE_PURE=1 bun test test/live-machine.test.ts",
     "verify:pack": "bun scripts/verify-pack.ts",
     "prepare": "if [ -e .git ]; then lefthook install; fi"
   },

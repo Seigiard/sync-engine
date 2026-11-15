@@ -1,4 +1,5 @@
 import { Cause, Deferred, Effect, Exit, Queue, type Scope } from "effect";
+import type { OutputCleanup } from "./source.ts";
 
 export interface WorkFailure<W, E = unknown> {
   readonly work: W;
@@ -20,7 +21,7 @@ export interface WorkScheduler<W, E> {
 }
 
 export interface WorkOptions<W, E, R> {
-  readonly handle: (work: W) => Effect.Effect<readonly W[], E, R>;
+  readonly handle: (work: W, cleanup?: OutputCleanup) => Effect.Effect<readonly W[], E, R>;
   /** Maximum number of independent work items that may run at the same time. Defaults to one. */
   readonly concurrency?: number;
   /** Only pending work with a defined key combines. Active work always gets a follow-up. */

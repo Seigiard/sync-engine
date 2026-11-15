@@ -2,10 +2,11 @@ import { test, expect } from "bun:test";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Effect } from "effect";
-import { runInitialPass } from "../src/index.ts";
+import { Effect, Exit } from "effect";
+import { openSynchronization, runInitialPass } from "../src/index.ts";
 
 const io = <A>(run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: (cause) => new Error(String(cause)) }).pipe(Effect.uninterruptible);
+type BoundCleanup = (outputs: readonly string[]) => Effect.Effect<boolean, Error>;
 
 test("regular source paths produce downstream work before final publication", async () => {
   // #given real files and a source symlink which must not enter the listing
@@ -146,6 +147,104 @@ test("an output inside the source is rejected before creating directories", asyn
     // #then the source tree is still empty
     expect({ outcome, sourceEntries: await readdir(sourcePath) })
       .toEqual({ outcome: "invalid output", sourceEntries: [] });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("handlers remove declared obsolete projections during initial and later session work", async () => {
+  // #given obsolete outputs owned by one source/output session
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-handler-cleanup-"));
+  const sourcePath = join(root, "source");
+  const outputPath = join(root, "output");
+  const initialOutput = join(outputPath, "obsolete-initial");
+  const laterOutput = join(outputPath, "obsolete-later");
+  await mkdir(sourcePath);
+  await mkdir(outputPath);
+  await Bun.write(initialOutput, "Initial obsolete result");
+  await Bun.write(laterOutput, "Later obsolete result");
+  const removed: { readonly work: string; readonly value: boolean }[] = [];
+  try {
+    // #when the same handler receives work during opening and after opening returns
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const session = yield* openSynchronization({
+        sourcePath, outputPath,
+        declare: () => Effect.succeed({ work: ["initial"], publish: Effect.void }),
+        handle: (work: string, cleanup?: BoundCleanup) =>
+          (cleanup?.([`obsolete-${work}`]) ?? Effect.succeed(false)).pipe(Effect.map((value) => {
+            removed.push({ work, value });
+            return [];
+          })),
+      });
+      yield* session.submit(["later"]);
+      yield* session.awaitCompletion;
+    })));
+    // #then the public handler capability removes exactly its declared obsolete paths in both phases
+    expect({
+      removed,
+      initialExists: await Bun.file(initialOutput).exists(),
+      laterExists: await Bun.file(laterOutput).exists(),
+    }).toEqual({
+      removed: [{ work: "initial", value: true }, { work: "later", value: true }],
+      initialExists: false,
+      laterExists: false,
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("captured cleanup rejects after successful and failed opening scopes without deleting output", async () => {
+  // #given one successful and one failed partial opening that each expose a handler cleanup operation
+  const root = await mkdtemp(join(tmpdir(), "sync-engine-closed-cleanup-"));
+  const sourcePath = join(root, "source");
+  const successfulOutputPath = join(root, "successful-output");
+  const failedOutputPath = join(root, "failed-output");
+  const successfulResult = join(successfulOutputPath, "obsolete");
+  const failedResult = join(failedOutputPath, "obsolete");
+  await mkdir(sourcePath);
+  await mkdir(successfulOutputPath);
+  await mkdir(failedOutputPath);
+  await Bun.write(successfulResult, "Successful-scope result");
+  await Bun.write(failedResult, "Failed-scope result");
+  let afterSuccessfulScope: BoundCleanup | undefined;
+  let afterFailedScope: BoundCleanup | undefined;
+  try {
+    // #when each captured operation is called only after its owning scope has closed
+    await Effect.runPromise(Effect.scoped(openSynchronization({
+      sourcePath, outputPath: successfulOutputPath,
+      declare: () => Effect.succeed({ work: ["capture"], publish: Effect.void }),
+      handle: (_work: string, cleanup?: BoundCleanup) => Effect.sync(() => {
+        afterSuccessfulScope = cleanup;
+        return [];
+      }),
+    })));
+    const failedOpening = await Effect.runPromiseExit(Effect.scoped(openSynchronization({
+      sourcePath, outputPath: failedOutputPath,
+      declare: () => Effect.succeed({ work: ["capture", "fail"], publish: Effect.void }),
+      handle: (work: string, cleanup?: BoundCleanup) => work === "capture"
+        ? Effect.sync(() => {
+          afterFailedScope = cleanup;
+          return [];
+        })
+        : Effect.fail(new Error("Opening failed after capture")),
+    })));
+    const successfulCall = await Effect.runPromiseExit(afterSuccessfulScope?.(["obsolete"]) ?? Effect.succeed(false));
+    const failedCall = await Effect.runPromiseExit(afterFailedScope?.(["obsolete"]) ?? Effect.succeed(false));
+    // #then owner-scope lifetime, not captured function identity, prevents later removal
+    expect({
+      failedOpening: Exit.isFailure(failedOpening),
+      successfulCallFailed: Exit.isFailure(successfulCall),
+      failedCallFailed: Exit.isFailure(failedCall),
+      successfulResult: await readFile(successfulResult, "utf8"),
+      failedResult: await readFile(failedResult, "utf8"),
+    }).toEqual({
+      failedOpening: true,
+      successfulCallFailed: true,
+      failedCallFailed: true,
+      successfulResult: "Successful-scope result",
+      failedResult: "Failed-scope result",
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
