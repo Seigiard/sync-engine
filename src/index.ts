@@ -9,7 +9,7 @@ import { openSynchronizationInternal } from "./internal.ts";
 import type { InitialPass, Synchronization } from "./initial-pass.ts";
 import type { ScanFailed } from "./source-scan.ts";
 export { ScanFailed, scanSource } from "./source-scan.ts";
-export { differences, type SourceEntry } from "./source-snapshot.ts";
+export type { SourceEntry } from "./source-snapshot.ts";
 export type { InitialPass, InitialPlan, Synchronization } from "./initial-pass.ts";
 export { openFreshness, FreshnessFailed, type FreshnessOptions, type ResultDescriptor, type WorkInput } from "./freshness.ts";
 
